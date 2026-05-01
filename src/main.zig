@@ -14,7 +14,7 @@ comptime {
 const FreeBlockQueue = Io.Queue(*Loader.Block);
 const ReadyBlockQueue = Io.Queue(*Loader.Block);
 const ShardQueue = ShardingLayer.ReadyQueue;
-const loader_buffer_size = 1024 * 1024;
+const loader_buffer_size = 4 * 1024 * 1024;
 const block_sentence_capacity = 1024;
 const asset_dir_name = "asset";
 var global_metrics: Metrics = .{};
@@ -59,7 +59,6 @@ const Context = struct {
 
 const LoaderContext = struct {
     io: std.Io,
-    cli: Cli,
     file: Io.File,
     shard_queue: *ShardQueue,
     max_sentence_len: usize,
@@ -106,7 +105,7 @@ fn submitBlock(context: LoaderContext, block: *Loader.Block, target_queue: *Read
 
 fn loaderWorker(context: LoaderContext) Io.Cancelable!void {
     var loader_buffer: [loader_buffer_size]u8 = undefined;
-    var loader: Loader = .init(context.cli, &loader_buffer);
+    var loader: Loader = .init(&loader_buffer);
     defer loader.deinit(context.io);
 
     var local_bytes_processed: usize = 0;
@@ -223,7 +222,6 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
 
     const loader_context = LoaderContext{
         .io = io,
-        .cli = opt,
         .file = sharding_layer.file,
         .shard_queue = sharding_layer.getReadyQueue(),
         .max_sentence_len = sequence_len,

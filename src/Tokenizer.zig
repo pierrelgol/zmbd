@@ -1,6 +1,7 @@
 const std = @import("std");
 const heap = std.heap;
 const mem = std.mem;
+
 pub const Tokenizer = @This();
 
 arena: heap.ArenaAllocator,
@@ -53,27 +54,10 @@ pub fn reset(self: *Tokenizer) void {
     self.masks.clearRetainingCapacity();
 }
 
-fn paddedCapacity(len: usize) error{Overflow}!usize {
-    return try std.math.ceilPowerOfTwo(usize, len);
-}
-
 fn ensureTotalCapacityPrecise(self: *Tokenizer, new_capacity: usize) !void {
     const allocator = self.arena.allocator();
     try self.ids.ensureTotalCapacityPrecise(allocator, new_capacity);
     try self.masks.ensureTotalCapacityPrecise(allocator, new_capacity);
-}
-
-pub fn encodeUneven(self: *Tokenizer, sentence: []const u8, policy: Policy) !void {
-    // this is better for the hot path. since I guess most tokenizer
-    // should operate on the assumptions of fixed sentencess anyway
-    _ = self.arena.reset(.retain_capacity);
-    const encoded_len = sentence.len + policy.overhead();
-    const capacity = try paddedCapacity(encoded_len);
-    const padding_len = capacity - encoded_len;
-
-    self.reset();
-    try self.ensureTotalCapacityPrecise(capacity);
-    self.encodeAssumeCapacity(sentence, policy, padding_len);
 }
 
 pub fn encode(self: *Tokenizer, sentence: []const u8) void {
@@ -85,28 +69,37 @@ pub fn encode(self: *Tokenizer, sentence: []const u8) void {
     self.encodeAssumeCapacity(sentence, policy, policy.max_seq_len - encoded_len);
 }
 
-fn encodeAssumeCapacity(self: *Tokenizer, sentence: []const u8, policy: Policy, padding_len: usize) void {
-    if (policy.add_bos) {
-        self.appendAssumeCapacity(.bos, valid_mask);
-    }
-
-    for (sentence) |byte| {
-        self.appendAssumeCapacity(.from(byte), valid_mask);
-    }
-
-    if (policy.add_eos) {
-        self.appendAssumeCapacity(.eos, valid_mask);
-    }
-
+inline fn encodeAssumeCapacity(self: *Tokenizer, sentence: []const u8, policy: Policy, padding_len: usize) void {
+    self.appendPrefixAssumeCapacity(policy);
+    self.appendSentenceAssumeCapacity(sentence);
+    self.appendSuffixAssumeCapacity(policy);
     self.padAssumeCapacity(padding_len);
 }
 
-fn appendAssumeCapacity(self: *Tokenizer, id: ByteEncoded.Id, mask: ByteEncoded.Mask) void {
+inline fn appendPrefixAssumeCapacity(self: *Tokenizer, policy: Policy) void {
+    if (policy.add_bos) {
+        self.appendAssumeCapacity(.bos, valid_mask);
+    }
+}
+
+inline fn appendSentenceAssumeCapacity(self: *Tokenizer, sentence: []const u8) void {
+    for (sentence) |byte| {
+        self.appendAssumeCapacity(.from(byte), valid_mask);
+    }
+}
+
+inline fn appendSuffixAssumeCapacity(self: *Tokenizer, policy: Policy) void {
+    if (policy.add_eos) {
+        self.appendAssumeCapacity(.eos, valid_mask);
+    }
+}
+
+inline fn appendAssumeCapacity(self: *Tokenizer, id: ByteEncoded.Id, mask: ByteEncoded.Mask) void {
     self.ids.appendAssumeCapacity(id);
     self.masks.appendAssumeCapacity(mask);
 }
 
-fn padAssumeCapacity(self: *Tokenizer, n: usize) void {
+inline fn padAssumeCapacity(self: *Tokenizer, n: usize) void {
     self.ids.appendNTimesAssumeCapacity(.pad, n);
     self.masks.appendNTimesAssumeCapacity(pad_mask, n);
 }
