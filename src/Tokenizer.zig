@@ -12,7 +12,7 @@ const valid_mask: ByteEncoded.Mask = 1;
 const pad_mask: ByteEncoded.Mask = 0;
 
 pub const Policy = struct {
-    max_seq_len: u32 = 4096,
+    max_seq_len: u32 = 80,
     add_bos: bool = true,
     add_eos: bool = true,
 

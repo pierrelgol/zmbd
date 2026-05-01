@@ -62,8 +62,8 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
     }
 }
 
-fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, worker_count: usize) !void {
-    const policy: Tokenizer.Policy = .{};
+fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, worker_count: usize, max_seq_len: u32) !void {
+    const policy: Tokenizer.Policy = .{ .max_seq_len = max_seq_len };
     const sequence_len = policy.effectiveMaxSequenceLength();
 
     const all_sequence_bytes = try gpa.alloc(u8, worker_count * sequence_len);
@@ -156,6 +156,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         global_metrics.report(@intCast(elapsed.nanoseconds));
     }
 
-    try runQueuePipeline(gpa, io, &loader, cli.worker_count);
+    try runQueuePipeline(gpa, io, &loader, cli.worker_count, cli.max_seq_length);
     std.debug.print("\n", .{});
 }
