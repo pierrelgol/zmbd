@@ -1,0 +1,34 @@
+#!/usr/bin/sh
+
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 4G   > G4.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 2G   > G2.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 1G   > G1.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 512M > M512.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 256M > M256.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 128M > M128.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 64M  > M64.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 32M  > M32.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 16M  > M16.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 8M   > M8.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 4M   > M4.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 2M   > M2.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 1M   > M1.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 512K > K512.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 256K > K256.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 128K > K128.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 64K  > K64.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 32K  > K32.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 16K  > K16.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 8K   > K8.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 4K   > K4.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 2K   > K2.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 1K   > K1.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 512B > B512.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 512b > B512.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 256b > B256.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 128b > B128.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 64b  > B64.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 32b  > B32.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 16b  > B16.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 8b   > B8.txt
+tr -dc 'A-Za-z0-9 \n' < /dev/urandom | head -c 4b   > B4.txt
