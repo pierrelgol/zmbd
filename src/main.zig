@@ -49,6 +49,7 @@ const Metrics = struct {
 
 const Context = struct {
     io: std.Io,
+    gpa: mem.Allocator,
     policy: Tokenizer.Policy,
     free_block_queue: *FreeBlockQueue,
     ready_queue: *ReadyBlockQueue,
@@ -65,7 +66,7 @@ const LoaderContext = struct {
 };
 
 fn tokenizerWorker(context: Context) Io.Cancelable!void {
-    var tokenizer: Tokenizer = Tokenizer.initWithPolicy(std.heap.page_allocator, context.policy) catch |err| @panic(@errorName(err));
+    var tokenizer: Tokenizer = Tokenizer.initWithPolicy(context.gpa, context.policy) catch |err| @panic(@errorName(err));
     defer tokenizer.deinit();
 
     while (true) {
@@ -219,6 +220,7 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
             .policy = policy,
             .free_block_queue = &free_block_queue,
             .ready_queue = ready_queue,
+            .gpa = gpa,
         };
         try tokenizer_group.concurrent(io, tokenizerWorker, .{worker_context});
     }
