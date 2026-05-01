@@ -3,6 +3,7 @@ const Io = std.Io;
 const mem = std.mem;
 
 const Cli = @import("Cli.zig");
+const ShardingLayer = @import("ShardingLayer.zig");
 
 cli: Cli,
 file: ?Io.File,
@@ -39,6 +40,10 @@ pub fn getReader(self: *@This()) *Io.Reader {
 
 pub fn sentenceFiller(self: *@This(), delimiter: u8) SentenceFiller {
     return .init(self.getReader(), delimiter);
+}
+
+pub fn mappedSentenceFiller(_: *@This(), bytes: []const u8, delimiter: u8) MappedSentenceFiller {
+    return .init(bytes, delimiter);
 }
 
 pub const Work = struct {
@@ -91,6 +96,42 @@ pub const SentenceFiller = struct {
             }
 
             work_item.buffer[work_item.len] = byte;
+        }
+    }
+};
+
+pub const MappedSentenceFiller = struct {
+    bytes: []const u8,
+    delimiter: u8,
+    offset: usize = 0,
+
+    pub fn init(bytes: []const u8, delimiter: u8) MappedSentenceFiller {
+        return .{
+            .bytes = bytes,
+            .delimiter = delimiter,
+        };
+    }
+
+    pub fn next(self: *MappedSentenceFiller, work_item: *Work) !void {
+        work_item.reset();
+
+        while (self.offset < self.bytes.len and work_item.len < work_item.buffer.len) {
+            const byte = self.bytes[self.offset];
+            self.offset += 1;
+
+            if (byte == self.delimiter) {
+                if (work_item.len == 0) {
+                    continue;
+                }
+                return;
+            }
+
+            work_item.buffer[work_item.len] = byte;
+            work_item.len += 1;
+        }
+
+        if (work_item.len == 0) {
+            return error.Canceled;
         }
     }
 };

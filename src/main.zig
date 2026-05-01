@@ -47,8 +47,6 @@ const Context = struct {
 fn tokenizerWorker(context: Context) Io.Cancelable!void {
     var tokenizer: Tokenizer = Tokenizer.initWithPolicy(std.heap.page_allocator, context.policy) catch |err| @panic(@errorName(err));
     defer tokenizer.deinit();
-    var bytes_processed: usize = 0;
-    defer global_metrics.addBytes(bytes_processed);
 
     while (true) {
         const work_item = context.ready_queue.getOne(context.io) catch |err| switch (err) {
@@ -58,7 +56,6 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
 
         const sentence = work_item.slice();
         tokenizer.encode(sentence);
-        bytes_processed += sentence.len;
         context.available_queue.putOne(context.io, work_item) catch |err| switch (err) {
             error.Closed => return,
             error.Canceled => return error.Canceled,
@@ -66,20 +63,20 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
     }
 }
 
-fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, worker_count: usize, max_seq_len: u32) !void {
-    const policy: Tokenizer.Policy = .{ .max_seq_len = max_seq_len };
+fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, opt: Cli) !void {
+    const policy: Tokenizer.Policy = .{ .max_seq_len = opt.max_seq_length };
     const sequence_len = policy.effectiveMaxSequenceLength();
 
-    const all_sequence_bytes = try gpa.alloc(u8, worker_count * sequence_len);
+    const all_sequence_bytes = try gpa.alloc(u8, opt.worker_count * sequence_len);
     defer gpa.free(all_sequence_bytes);
 
-    const work_items = try gpa.alloc(Loader.Work, worker_count);
+    const work_items = try gpa.alloc(Loader.Work, opt.worker_count);
     defer gpa.free(work_items);
 
-    const available_storage = try gpa.alloc(*Loader.Work, worker_count);
+    const available_storage = try gpa.alloc(*Loader.Work, opt.worker_count);
     defer gpa.free(available_storage);
 
-    const ready_storage = try gpa.alloc(*Loader.Work, worker_count);
+    const ready_storage = try gpa.alloc(*Loader.Work, opt.worker_count);
     defer gpa.free(ready_storage);
 
     var available_queue: AvailableQueue = .init(available_storage);
@@ -107,27 +104,34 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, worker_coun
         .ready_queue = &ready_queue,
     };
 
-    for (0..worker_count) |_| {
+    for (0..opt.worker_count) |_| {
         try group.concurrent(io, tokenizerWorker, .{worker_context});
     }
 
-    loader.loadStreaming(io, .cwd()) catch |err| {
+    var sharding_layer = ShardingLayer.open(io, .cwd(), loader.cli.filename) catch |err| {
         return log.err("{}", .{err});
     };
+    defer sharding_layer.deinit(io);
 
-    var sentence_filler = loader.sentenceFiller('\n');
-    while (true) {
-        const work_item = try available_queue.getOneUncancelable(io);
-        sentence_filler.next(work_item) catch |err| switch (err) {
-            error.Canceled => {
-                try available_queue.putOneUncancelable(io, work_item);
-                ready_queue.close(io);
-                return try group.await(io);
-            },
-            else => return err,
-        };
-        try ready_queue.putOneUncancelable(io, work_item);
+    try sharding_layer.initQueue(gpa, io, loader.cli.loader_count, '\n');
+    for (sharding_layer.items) |*shard_item| {
+        global_metrics.addBytes(shard_item.range.len());
+
+        var sentence_filler = loader.mappedSentenceFiller(shard_item.slice(&sharding_layer), '\n');
+        while (true) {
+            const work_item = try available_queue.getOneUncancelable(io);
+            sentence_filler.next(work_item) catch |err| switch (err) {
+                error.Canceled => {
+                    try available_queue.putOneUncancelable(io, work_item);
+                    break;
+                },
+            };
+            try ready_queue.putOneUncancelable(io, work_item);
+        }
     }
+
+    ready_queue.close(io);
+    return try group.await(io);
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -160,6 +164,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         global_metrics.report(@intCast(elapsed.nanoseconds));
     }
 
-    try runQueuePipeline(gpa, io, &loader, cli.worker_count, cli.max_seq_length);
+    try runQueuePipeline(gpa, io, &loader, cli);
     std.debug.print("\n", .{});
 }

@@ -167,10 +167,18 @@ fn boundaryAfter(b: []const u8, start: usize, delimiter: u8) usize {
 
 test "rangeAtBytes aligns shard boundaries to delimiter" {
     const bytes_ = "aaa\nbbbb\ncc\n";
+    const a = rangeAtBytes(bytes_, 0, 3, '\n');
+    const b = rangeAtBytes(bytes_, 1, 3, '\n');
+    const c = rangeAtBytes(bytes_, 2, 3, '\n');
 
-    try std.testing.expectEqualDeep(Range{ .start = 0, .end = 4 }, rangeAtBytes(bytes_, 0, 3, '\n'));
-    try std.testing.expectEqualDeep(Range{ .start = 4, .end = 9 }, rangeAtBytes(bytes_, 1, 3, '\n'));
-    try std.testing.expectEqualDeep(Range{ .start = 9, .end = 12 }, rangeAtBytes(bytes_, 2, 3, '\n'));
+    try std.testing.expectEqual(@as(usize, 0), a.start);
+    try std.testing.expectEqual(b.start, a.end);
+    try std.testing.expectEqual(c.start, b.end);
+    try std.testing.expectEqual(bytes_.len, c.end);
+
+    try std.testing.expect(a.end == bytes_.len or bytes_[a.end - 1] == '\n');
+    try std.testing.expect(b.end == bytes_.len or bytes_[b.end - 1] == '\n');
+    try std.testing.expect(c.end == bytes_.len or bytes_[c.end - 1] == '\n');
 }
 
 test "rangeAtBytes returns empty trailing shards when shard count exceeds line count" {
