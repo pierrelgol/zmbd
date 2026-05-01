@@ -2,6 +2,7 @@ const std = @import("std");
 const ascii = std.ascii;
 const mem = std.mem;
 const process = std.process;
+pub const Cli = @This();
 
 filename: ?[]const u8,
 worker_count: u32,
@@ -11,18 +12,18 @@ loader_buffer_size: usize,
 block_sentence_capacity: usize,
 asset_dir: []const u8,
 
-pub const empty: @This() = .{
+pub const empty: Cli = .{
     .filename = null,
     .worker_count = 16,
     .max_seq_length = 80,
     .loader_count = 16,
-    .loader_buffer_size = 1024 * 1024,
-    .block_sentence_capacity = 1024,
+    .loader_buffer_size = std.heap.pageSize() * 8,
+    .block_sentence_capacity = std.heap.pageSize(),
     .asset_dir = "asset",
 };
 
-pub fn parse(it: *process.Args.Iterator) !@This() {
-    var result: @This() = .empty;
+pub fn parse(it: *process.Args.Iterator) !Cli {
+    var result: Cli = .empty;
 
     while (it.next()) |arg| {
         const trimmed = mem.trim(u8, arg, &ascii.whitespace);
@@ -72,7 +73,7 @@ pub fn parse(it: *process.Args.Iterator) !@This() {
     return result;
 }
 
-fn validate(self: @This()) !void {
+fn validate(self: Cli) !void {
     if (self.worker_count == 0) return error.InvalidWorkerCount;
     if (self.loader_count == 0) return error.InvalidLoaderCount;
     if (self.max_seq_length == 0) return error.InvalidMaxSequenceLength;

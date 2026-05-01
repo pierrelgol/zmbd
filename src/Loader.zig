@@ -1,14 +1,13 @@
 const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
-
 const ShardingLayer = @import("ShardingLayer.zig");
 
 pub const Loader = @This();
 
 buffer: []u8,
 
-pub fn init(buffer: []u8) @This() {
+pub fn init(buffer: []u8) Loader {
     return .{ .buffer = buffer };
 }
 
@@ -17,7 +16,7 @@ pub fn deinit(self: *Loader, io: Io) void {
     self.* = undefined;
 }
 
-pub fn rangeBlockFiller(self: *@This(), file: Io.File, io: Io, range: ShardingLayer.Range, delimiter: u8) RangeBlockFiller {
+pub fn rangeBlockFiller(self: *Loader, file: Io.File, io: Io, range: ShardingLayer.Range, delimiter: u8) RangeBlockFiller {
     std.debug.assert(self.buffer.len > 0);
     std.debug.assert(range.start <= range.end);
     return .init(file, io, range, self.buffer, delimiter);
