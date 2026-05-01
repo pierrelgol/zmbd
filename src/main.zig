@@ -13,6 +13,8 @@ comptime {
 
 const AvailableQueue = Io.Queue(*Loader.Work);
 const ReadyQueue = Io.Queue(*Loader.Work);
+const ShardQueue = ShardingLayer.ReadyQueue;
+const loader_buffer_size = 256 * 1024;
 var global_metrics: Metrics = .{};
 
 const Metrics = struct {
@@ -44,6 +46,15 @@ const Context = struct {
     ready_queue: *ReadyQueue,
 };
 
+const LoaderContext = struct {
+    io: std.Io,
+    cli: Cli,
+    file: Io.File,
+    shard_queue: *ShardQueue,
+    available_queue: *AvailableQueue,
+    ready_queue: *ReadyQueue,
+};
+
 fn tokenizerWorker(context: Context) Io.Cancelable!void {
     var tokenizer: Tokenizer = Tokenizer.initWithPolicy(std.heap.page_allocator, context.policy) catch |err| @panic(@errorName(err));
     defer tokenizer.deinit();
@@ -63,7 +74,48 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
     }
 }
 
-fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, opt: Cli) !void {
+fn loaderWorker(context: LoaderContext) Io.Cancelable!void {
+    var loader_buffer: [loader_buffer_size]u8 = undefined;
+    var loader: Loader = .init(context.cli, &loader_buffer);
+    defer loader.deinit(context.io);
+
+    var local_bytes_processed: usize = 0;
+    defer global_metrics.addBytes(local_bytes_processed);
+
+    while (true) {
+        const shard_item = context.shard_queue.getOne(context.io) catch |err| switch (err) {
+            error.Closed => return,
+            error.Canceled => return error.Canceled,
+        };
+
+        local_bytes_processed += shard_item.range.len();
+        var sentence_filler = loader.rangeSentenceFiller(context.file, context.io, shard_item.range, '\n');
+        while (true) {
+            const work_item = context.available_queue.getOne(context.io) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => return error.Canceled,
+            };
+
+            sentence_filler.next(work_item) catch |err| switch (err) {
+                error.Canceled => {
+                    context.available_queue.putOne(context.io, work_item) catch |put_err| switch (put_err) {
+                        error.Closed => return,
+                        error.Canceled => return error.Canceled,
+                    };
+                    break;
+                },
+                else => @panic(@errorName(err)),
+            };
+
+            context.ready_queue.putOne(context.io, work_item) catch |err| switch (err) {
+                error.Closed => return,
+                error.Canceled => return error.Canceled,
+            };
+        }
+    }
+}
+
+fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     const policy: Tokenizer.Policy = .{ .max_seq_len = opt.max_seq_length };
     const sequence_len = policy.effectiveMaxSequenceLength();
 
@@ -81,13 +133,16 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, opt: Cli) !
 
     var available_queue: AvailableQueue = .init(available_storage);
     var ready_queue: ReadyQueue = .init(ready_storage);
-    var group: Io.Group = .init;
+    var tokenizer_group: Io.Group = .init;
+    var loader_group: Io.Group = .init;
 
     errdefer {
         ready_queue.close(io);
         available_queue.close(io);
-        group.cancel(io);
-        group.await(io) catch {};
+        loader_group.cancel(io);
+        tokenizer_group.cancel(io);
+        loader_group.await(io) catch {};
+        tokenizer_group.await(io) catch {};
     }
 
     for (work_items, 0..) |*work_item, i| {
@@ -105,34 +160,33 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, opt: Cli) !
     };
 
     for (0..opt.worker_count) |_| {
-        try group.concurrent(io, tokenizerWorker, .{worker_context});
+        try tokenizer_group.concurrent(io, tokenizerWorker, .{worker_context});
     }
 
-    var sharding_layer = ShardingLayer.open(io, .cwd(), loader.cli.filename) catch |err| {
+    var sharding_layer = ShardingLayer.open(io, .cwd(), opt.filename) catch |err| {
         return log.err("{}", .{err});
     };
     defer sharding_layer.deinit(io);
 
-    try sharding_layer.initQueue(gpa, io, loader.cli.loader_count, '\n');
-    for (sharding_layer.items) |*shard_item| {
-        global_metrics.addBytes(shard_item.range.len());
+    try sharding_layer.initQueue(gpa, io, opt.loader_count, '\n');
+    sharding_layer.getReadyQueue().close(io);
 
-        var sentence_filler = loader.rangeSentenceFiller(sharding_layer.file, io, shard_item.range, '\n');
-        while (true) {
-            const work_item = try available_queue.getOneUncancelable(io);
-            sentence_filler.next(work_item) catch |err| switch (err) {
-                error.Canceled => {
-                    try available_queue.putOneUncancelable(io, work_item);
-                    break;
-                },
-                else => return err,
-            };
-            try ready_queue.putOneUncancelable(io, work_item);
-        }
+    const loader_context = LoaderContext{
+        .io = io,
+        .cli = opt,
+        .file = sharding_layer.file,
+        .shard_queue = sharding_layer.getReadyQueue(),
+        .available_queue = &available_queue,
+        .ready_queue = &ready_queue,
+    };
+
+    for (0..opt.loader_count) |_| {
+        try loader_group.concurrent(io, loaderWorker, .{loader_context});
     }
 
+    try loader_group.await(io);
     ready_queue.close(io);
-    return try group.await(io);
+    return try tokenizer_group.await(io);
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -154,10 +208,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     std.debug.print("{s}\n", .{cli.filename});
 
-    var loader_buffer: [256 * 1024]u8 = undefined;
-    var loader: Loader = .init(cli, &loader_buffer);
-    defer loader.deinit(io);
-
     global_metrics.reset();
     const begin = Io.Timestamp.now(io, .awake);
     defer {
@@ -165,6 +215,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         global_metrics.report(@intCast(elapsed.nanoseconds));
     }
 
-    try runQueuePipeline(gpa, io, &loader, cli);
+    try runQueuePipeline(gpa, io, cli);
     std.debug.print("\n", .{});
 }
