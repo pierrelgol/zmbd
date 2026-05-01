@@ -4,9 +4,11 @@ const mem = std.mem;
 const process = std.process;
 
 filename: []const u8,
+worker_count: usize,
 
 pub const empty: @This() = .{
     .filename = undefined,
+    .worker_count = 1,
 };
 
 pub fn parse(it: *process.Args.Iterator) !@This() {
@@ -17,6 +19,11 @@ pub fn parse(it: *process.Args.Iterator) !@This() {
 
         if (mem.eql(u8, "-p", trimmed)) {
             result.filename = it.next() orelse return error.MissingArgument;
+        }
+
+        if (mem.eql(u8, "-j", trimmed)) {
+            const value = mem.trim(u8, it.next() orelse return error.MissingArgument, &ascii.whitespace);
+            result.worker_count = try std.fmt.parseInt(usize, value, 10);
         }
     }
 

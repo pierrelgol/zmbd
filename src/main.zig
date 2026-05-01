@@ -41,7 +41,7 @@ const Context = struct {
 };
 
 fn tokenizerWorker(context: Context) Io.Cancelable!void {
-    var tokenizer: Tokenizer = .init(std.heap.page_allocator);
+    var tokenizer: Tokenizer = Tokenizer.initWithPolicy(std.heap.page_allocator, context.policy) catch |err| @panic(@errorName(err));
     defer tokenizer.deinit();
 
     while (true) {
@@ -51,7 +51,7 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
         };
 
         const sentence = work_item.slice();
-        tokenizer.encode(sentence, context.policy) catch |err| @panic(@errorName(err));
+        tokenizer.encode(sentence);
         global_metrics.addBytes(sentence.len);
         context.available_queue.putOne(context.io, work_item) catch |err| switch (err) {
             error.Closed => return,
@@ -60,9 +60,8 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
     }
 }
 
-fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader) !void {
+fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, worker_count: usize) !void {
     const policy: Tokenizer.Policy = .{};
-    const worker_count = 128;
     const sequence_len = policy.effectiveMaxSequenceLength();
 
     const all_sequence_bytes = try gpa.alloc(u8, worker_count * sequence_len);
@@ -148,9 +147,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var loader: Loader = .init(cli, &loader_buffer);
     defer loader.deinit(io);
 
-    var tokenizer: Tokenizer = .init(gpa);
-    defer tokenizer.deinit();
-
     global_metrics.reset();
     const begin = Io.Timestamp.now(io, .awake);
     defer {
@@ -158,6 +154,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         global_metrics.report(@intCast(elapsed.nanoseconds));
     }
 
-    try runQueuePipeline(gpa, io, &loader);
+    try runQueuePipeline(gpa, io, &loader, cli.worker_count);
     std.debug.print("\n", .{});
 }
