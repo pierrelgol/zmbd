@@ -18,6 +18,8 @@ pub fn deinit(self: *Loader, io: Io) void {
 }
 
 pub fn rangeBlockFiller(self: *@This(), file: Io.File, io: Io, range: ShardingLayer.Range, delimiter: u8) RangeBlockFiller {
+    std.debug.assert(self.buffer.len > 0);
+    std.debug.assert(range.start <= range.end);
     return .init(file, io, range, self.buffer, delimiter);
 }
 
@@ -55,6 +57,8 @@ pub const Block = struct {
 
     fn appendSpan(self: *Block, start: usize, len: usize) void {
         std.debug.assert(self.span_count < self.spans.len);
+        std.debug.assert(start <= self.bytes.len);
+        std.debug.assert(len <= self.bytes.len - start);
         self.spans[self.span_count] = .{
             .start = @intCast(start),
             .len = @intCast(len),
@@ -74,6 +78,8 @@ pub const RangeBlockFiller = struct {
     buffer_len: usize = 0,
 
     pub fn init(file: Io.File, io: Io, range: ShardingLayer.Range, buffer: []u8, delimiter: u8) RangeBlockFiller {
+        std.debug.assert(buffer.len > 0);
+        std.debug.assert(range.start <= range.end);
         return .{
             .file = file,
             .io = io,
@@ -85,6 +91,7 @@ pub const RangeBlockFiller = struct {
     }
 
     fn refill(self: *RangeBlockFiller) !bool {
+        std.debug.assert(self.buffer.len > 0);
         if (self.file_offset >= self.range.end) {
             self.buffer_start = 0;
             self.buffer_len = 0;
@@ -93,6 +100,7 @@ pub const RangeBlockFiller = struct {
 
         const to_read = @min(self.buffer.len, self.range.end - self.file_offset);
         const amt = try self.file.readPositionalAll(self.io, self.buffer[0..to_read], self.file_offset);
+        std.debug.assert(amt <= to_read);
         self.file_offset += amt;
         self.buffer_start = 0;
         self.buffer_len = amt;
@@ -100,10 +108,14 @@ pub const RangeBlockFiller = struct {
     }
 
     pub fn nextBlock(self: *RangeBlockFiller, block: *Block, max_sentence_len: usize) !void {
+        std.debug.assert(max_sentence_len > 0);
+        std.debug.assert(block.bytes.len > 0);
+        std.debug.assert(block.spans.len > 0);
         block.reset();
 
         while (block.span_count < block.spans.len) {
             const sentence_start = block.used;
+            std.debug.assert(sentence_start <= block.bytes.len);
 
             while (block.used - sentence_start < max_sentence_len) {
                 if (self.buffer_start == self.buffer_len) {
@@ -123,10 +135,14 @@ pub const RangeBlockFiller = struct {
 
                 const unread = self.buffer[self.buffer_start..self.buffer_len];
                 const remaining = max_sentence_len - (block.used - sentence_start);
+                std.debug.assert(self.buffer_start <= self.buffer_len);
+                std.debug.assert(block.used <= block.bytes.len);
+                std.debug.assert(remaining > 0);
 
                 if (mem.indexOfScalar(u8, unread, self.delimiter)) |pos| {
                     const line = unread[0..pos];
                     const copy_len = @min(line.len, remaining);
+                    std.debug.assert(block.used + copy_len <= block.bytes.len);
                     mem.copyForwards(u8, block.bytes[block.used .. block.used + copy_len], line[0..copy_len]);
                     block.used += copy_len;
                     self.buffer_start += copy_len;
@@ -140,6 +156,7 @@ pub const RangeBlockFiller = struct {
                 }
 
                 const copy_len = @min(unread.len, remaining);
+                std.debug.assert(block.used + copy_len <= block.bytes.len);
                 mem.copyForwards(u8, block.bytes[block.used .. block.used + copy_len], unread[0..copy_len]);
                 block.used += copy_len;
                 self.buffer_start += copy_len;

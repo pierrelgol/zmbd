@@ -68,5 +68,15 @@ pub fn parse(it: *process.Args.Iterator) !@This() {
         }
     }
 
+    try result.validate();
     return result;
+}
+
+fn validate(self: @This()) !void {
+    if (self.worker_count == 0) return error.InvalidWorkerCount;
+    if (self.loader_count == 0) return error.InvalidLoaderCount;
+    if (self.max_seq_length == 0) return error.InvalidMaxSequenceLength;
+    if (self.loader_buffer_size == 0) return error.InvalidLoaderBufferSize;
+    if (self.block_sentence_capacity == 0) return error.InvalidBlockSentenceCapacity;
+    if (self.asset_dir.len == 0) return error.InvalidAssetDirectory;
 }

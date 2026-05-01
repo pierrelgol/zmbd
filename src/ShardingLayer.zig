@@ -50,9 +50,11 @@ pub fn deinit(self: *ShardingLayer, io: Io) void {
 
 pub fn initQueue(self: *ShardingLayer, allocator: mem.Allocator, io: Io, shard_count: usize, delimiter: u8) !void {
     std.debug.assert(self.ready_queue == null);
+    std.debug.assert(shard_count > 0);
 
     self.allocator = allocator;
     self.items = try allocator.alloc(Item, shard_count);
+    std.debug.assert(self.items.len == shard_count);
     errdefer {
         allocator.free(self.items);
         self.items = &.{};
@@ -60,6 +62,7 @@ pub fn initQueue(self: *ShardingLayer, allocator: mem.Allocator, io: Io, shard_c
     }
 
     self.ready_queue_storage = try allocator.alloc(*Item, shard_count);
+    std.debug.assert(self.ready_queue_storage.len == shard_count);
     errdefer {
         allocator.free(self.ready_queue_storage);
         self.ready_queue_storage = &.{};
@@ -71,6 +74,7 @@ pub fn initQueue(self: *ShardingLayer, allocator: mem.Allocator, io: Io, shard_c
     self.ready_queue = .init(self.ready_queue_storage);
 
     var scratch: [64 * 1024]u8 = undefined;
+    std.debug.assert(scratch.len > 0);
     for (self.items, 0..) |*item, index| {
         item.* = .{
             .index = index,
@@ -134,6 +138,7 @@ fn proportionalOffset(len: usize, index: usize, count: usize) usize {
 }
 
 fn boundaryAfterFile(file: Io.File, io: Io, size: usize, start: usize, delimiter: u8, scratch: []u8) !usize {
+    std.debug.assert(scratch.len > 0);
     if (start >= size) {
         return size;
     }
@@ -142,6 +147,7 @@ fn boundaryAfterFile(file: Io.File, io: Io, size: usize, start: usize, delimiter
     while (offset < size) {
         const to_read = @min(scratch.len, size - offset);
         const amt = try file.readPositionalAll(io, scratch[0..to_read], offset);
+        std.debug.assert(amt <= to_read);
         if (amt == 0) {
             return size;
         }

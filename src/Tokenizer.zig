@@ -39,6 +39,7 @@ pub fn initWithPolicy(gpa: mem.Allocator, policy: Policy) !Tokenizer {
     var tokenizer = init(gpa);
     errdefer tokenizer.deinit();
 
+    std.debug.assert(policy.max_seq_len > 0);
     tokenizer.policy = policy;
     try tokenizer.ensureTotalCapacityPrecise(policy.max_seq_len);
     return tokenizer;
@@ -64,12 +65,14 @@ pub fn encode(self: *Tokenizer, sentence: []const u8) void {
     const policy = self.policy orelse @panic("Tokenizer.encode requires initWithPolicy");
     const encoded_len = sentence.len + policy.overhead();
     std.debug.assert(encoded_len <= policy.max_seq_len);
+    std.debug.assert(policy.max_seq_len > 0);
 
     self.reset();
     self.encodeAssumeCapacity(sentence, policy, policy.max_seq_len - encoded_len);
 }
 
 inline fn encodeAssumeCapacity(self: *Tokenizer, sentence: []const u8, policy: Policy, padding_len: usize) void {
+    @branchHint(.likely);
     self.appendPrefixAssumeCapacity(policy);
     self.appendSentenceAssumeCapacity(sentence);
     self.appendSuffixAssumeCapacity(policy);
@@ -95,11 +98,15 @@ inline fn appendSuffixAssumeCapacity(self: *Tokenizer, policy: Policy) void {
 }
 
 inline fn appendAssumeCapacity(self: *Tokenizer, id: ByteEncoded.Id, mask: ByteEncoded.Mask) void {
+    std.debug.assert(self.ids.items.len < self.ids.capacity);
+    std.debug.assert(self.masks.items.len < self.masks.capacity);
     self.ids.appendAssumeCapacity(id);
     self.masks.appendAssumeCapacity(mask);
 }
 
 inline fn padAssumeCapacity(self: *Tokenizer, n: usize) void {
+    std.debug.assert(self.ids.items.len + n <= self.ids.capacity);
+    std.debug.assert(self.masks.items.len + n <= self.masks.capacity);
     self.ids.appendNTimesAssumeCapacity(.pad, n);
     self.masks.appendNTimesAssumeCapacity(pad_mask, n);
 }

@@ -102,6 +102,10 @@ fn submitBlock(context: LoaderContext, block: *Loader.Block, target_queue: *Read
 }
 
 fn loaderWorker(context: LoaderContext) Io.Cancelable!void {
+    std.debug.assert(context.loader_buffer.len > 0);
+    std.debug.assert(context.max_sentence_len > 0);
+    std.debug.assert(context.ready_queues.len > 0);
+
     var loader: Loader = .init(context.loader_buffer);
     defer loader.deinit(context.io);
 
@@ -155,6 +159,14 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     const sequence_len = policy.effectiveMaxSequenceLength();
     const block_count = @max(loader_count * 2, worker_count);
     const block_bytes_len = sequence_len * opt.block_sentence_capacity;
+
+    std.debug.assert(worker_count > 0);
+    std.debug.assert(loader_count > 0);
+    std.debug.assert(opt.block_sentence_capacity > 0);
+    std.debug.assert(opt.loader_buffer_size > 0);
+    std.debug.assert(sequence_len > 0);
+    std.debug.assert(block_count > 0);
+    std.debug.assert(block_bytes_len > 0);
 
     const all_block_bytes = try gpa.alloc(u8, block_count * block_bytes_len);
     defer gpa.free(all_block_bytes);
@@ -222,6 +234,7 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     for (0..loader_count) |i| {
         const buffer_start = i * opt.loader_buffer_size;
         const buffer_end = buffer_start + opt.loader_buffer_size;
+        std.debug.assert(buffer_end <= loader_buffers.len);
         const loader_context = LoaderContext{
             .io = io,
             .file = sharding_layer.file,
@@ -291,6 +304,10 @@ fn runAssetSuite(gpa: mem.Allocator, io: Io, cli: Cli) !void {
     }.lessThan;
 
     std.mem.sort(AssetEntry, assets.items, {}, lessThan);
+    for (assets.items, 1..) |entry, i| {
+        std.debug.assert(entry.size >= assets.items[i - 1].size);
+        std.debug.assert(entry.path.len > 0);
+    }
     std.debug.print("{s: <24}  {s: >12}  {s: >10}  {s: >24}\n", .{ "file", "size", "time", "throughput" });
 
     for (assets.items) |entry| {
