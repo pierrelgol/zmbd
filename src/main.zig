@@ -14,9 +14,6 @@ comptime {
 const FreeBlockQueue = Io.Queue(*Loader.Block);
 const ReadyBlockQueue = Io.Queue(*Loader.Block);
 const ShardQueue = ShardingLayer.ReadyQueue;
-const loader_buffer_size = 4 * 1024 * 1024;
-const block_sentence_capacity = 1024;
-const asset_dir_name = "asset";
 var global_metrics: Metrics = .{};
 
 const AssetEntry = struct {
@@ -62,6 +59,7 @@ const LoaderContext = struct {
     file: Io.File,
     shard_queue: *ShardQueue,
     max_sentence_len: usize,
+    loader_buffer: []u8,
     free_block_queue: *FreeBlockQueue,
     ready_queues: []ReadyBlockQueue,
 };
@@ -104,8 +102,7 @@ fn submitBlock(context: LoaderContext, block: *Loader.Block, target_queue: *Read
 }
 
 fn loaderWorker(context: LoaderContext) Io.Cancelable!void {
-    var loader_buffer: [loader_buffer_size]u8 = undefined;
-    var loader: Loader = .init(&loader_buffer);
+    var loader: Loader = .init(context.loader_buffer);
     defer loader.deinit(context.io);
 
     var local_bytes_processed: usize = 0;
@@ -157,14 +154,16 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     const loader_count: usize = opt.loader_count;
     const sequence_len = policy.effectiveMaxSequenceLength();
     const block_count = @max(loader_count * 2, worker_count);
-    const block_bytes_len = sequence_len * block_sentence_capacity;
+    const block_bytes_len = sequence_len * opt.block_sentence_capacity;
 
     const all_block_bytes = try gpa.alloc(u8, block_count * block_bytes_len);
     defer gpa.free(all_block_bytes);
-    const all_block_spans = try gpa.alloc(Loader.Span, block_count * block_sentence_capacity);
+    const all_block_spans = try gpa.alloc(Loader.Span, block_count * opt.block_sentence_capacity);
     defer gpa.free(all_block_spans);
     const blocks = try gpa.alloc(Loader.Block, block_count);
     defer gpa.free(blocks);
+    const loader_buffers = try gpa.alloc(u8, loader_count * opt.loader_buffer_size);
+    defer gpa.free(loader_buffers);
     const free_block_storage = try gpa.alloc(*Loader.Block, block_count);
     defer gpa.free(free_block_storage);
     const ready_queues = try gpa.alloc(ReadyBlockQueue, worker_count);
@@ -190,8 +189,8 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     for (blocks, 0..) |*block, i| {
         const byte_start = i * block_bytes_len;
         const byte_end = byte_start + block_bytes_len;
-        const span_start = i * block_sentence_capacity;
-        const span_end = span_start + block_sentence_capacity;
+        const span_start = i * opt.block_sentence_capacity;
+        const span_end = span_start + opt.block_sentence_capacity;
         block.* = .init(all_block_bytes[byte_start..byte_end], all_block_spans[span_start..span_end]);
         try free_block_queue.putOneUncancelable(io, block);
     }
@@ -220,16 +219,18 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     try sharding_layer.initQueue(gpa, io, opt.loader_count, '\n');
     sharding_layer.getReadyQueue().close(io);
 
-    const loader_context = LoaderContext{
-        .io = io,
-        .file = sharding_layer.file,
-        .shard_queue = sharding_layer.getReadyQueue(),
-        .max_sentence_len = sequence_len,
-        .free_block_queue = &free_block_queue,
-        .ready_queues = ready_queues,
-    };
-
-    for (0..loader_count) |_| {
+    for (0..loader_count) |i| {
+        const buffer_start = i * opt.loader_buffer_size;
+        const buffer_end = buffer_start + opt.loader_buffer_size;
+        const loader_context = LoaderContext{
+            .io = io,
+            .file = sharding_layer.file,
+            .shard_queue = sharding_layer.getReadyQueue(),
+            .max_sentence_len = sequence_len,
+            .loader_buffer = loader_buffers[buffer_start..buffer_end],
+            .free_block_queue = &free_block_queue,
+            .ready_queues = ready_queues,
+        };
         try loader_group.concurrent(io, loaderWorker, .{loader_context});
     }
 
@@ -261,7 +262,7 @@ fn runOne(gpa: mem.Allocator, io: Io, cli: Cli, pretty: bool, size: u64) !void {
 }
 
 fn runAssetSuite(gpa: mem.Allocator, io: Io, cli: Cli) !void {
-    var dir = try Io.Dir.cwd().openDir(io, asset_dir_name, .{ .iterate = true });
+    var dir = try Io.Dir.cwd().openDir(io, cli.asset_dir, .{ .iterate = true });
     defer dir.close(io);
 
     var it = dir.iterate();
@@ -274,7 +275,7 @@ fn runAssetSuite(gpa: mem.Allocator, io: Io, cli: Cli) !void {
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
 
-        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ asset_dir_name, entry.name });
+        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ cli.asset_dir, entry.name });
         errdefer gpa.free(path);
         const stat = try dir.statFile(io, entry.name, .{});
         try assets.append(gpa, .{

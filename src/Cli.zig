@@ -7,12 +7,18 @@ filename: ?[]const u8,
 worker_count: u32,
 loader_count: u32,
 max_seq_length: u32,
+loader_buffer_size: usize,
+block_sentence_capacity: usize,
+asset_dir: []const u8,
 
 pub const empty: @This() = .{
     .filename = null,
-    .worker_count = 8,
-    .max_seq_length = 128,
-    .loader_count = 8,
+    .worker_count = 16,
+    .max_seq_length = 80,
+    .loader_count = 16,
+    .loader_buffer_size = 1024 * 1024,
+    .block_sentence_capacity = 1024,
+    .asset_dir = "asset",
 };
 
 pub fn parse(it: *process.Args.Iterator) !@This() {
@@ -20,23 +26,45 @@ pub fn parse(it: *process.Args.Iterator) !@This() {
 
     while (it.next()) |arg| {
         const trimmed = mem.trim(u8, arg, &ascii.whitespace);
+        if (trimmed.len == 0) continue;
 
         if (mem.eql(u8, "-p", trimmed)) {
             result.filename = it.next() orelse return error.MissingArgument;
+            continue;
         }
 
         if (mem.eql(u8, "-j", trimmed)) {
             const value = mem.trim(u8, it.next() orelse return error.MissingArgument, &ascii.whitespace);
             result.worker_count = try std.fmt.parseInt(u32, value, 10);
+            continue;
         }
 
         if (mem.eql(u8, "-l", trimmed)) {
             const value = mem.trim(u8, it.next() orelse return error.MissingArgument, &ascii.whitespace);
             result.max_seq_length = try std.fmt.parseInt(u32, value, 10);
+            continue;
         }
         if (mem.eql(u8, "-L", trimmed)) {
             const value = mem.trim(u8, it.next() orelse return error.MissingArgument, &ascii.whitespace);
             result.loader_count = try std.fmt.parseInt(u32, value, 10);
+            continue;
+        }
+
+        if (mem.eql(u8, "-b", trimmed)) {
+            const value = mem.trim(u8, it.next() orelse return error.MissingArgument, &ascii.whitespace);
+            result.loader_buffer_size = try std.fmt.parseInt(usize, value, 10);
+            continue;
+        }
+
+        if (mem.eql(u8, "-c", trimmed)) {
+            const value = mem.trim(u8, it.next() orelse return error.MissingArgument, &ascii.whitespace);
+            result.block_sentence_capacity = try std.fmt.parseInt(usize, value, 10);
+            continue;
+        }
+
+        if (mem.eql(u8, "-a", trimmed)) {
+            result.asset_dir = it.next() orelse return error.MissingArgument;
+            continue;
         }
     }
 
