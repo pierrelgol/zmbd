@@ -117,7 +117,7 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, opt: Cli) !
     for (sharding_layer.items) |*shard_item| {
         global_metrics.addBytes(shard_item.range.len());
 
-        var sentence_filler = loader.mappedSentenceFiller(shard_item.slice(&sharding_layer), '\n');
+        var sentence_filler = loader.rangeSentenceFiller(sharding_layer.file, io, shard_item.range, '\n');
         while (true) {
             const work_item = try available_queue.getOneUncancelable(io);
             sentence_filler.next(work_item) catch |err| switch (err) {
@@ -125,6 +125,7 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader, opt: Cli) !
                     try available_queue.putOneUncancelable(io, work_item);
                     break;
                 },
+                else => return err,
             };
             try ready_queue.putOneUncancelable(io, work_item);
         }
@@ -153,7 +154,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     std.debug.print("{s}\n", .{cli.filename});
 
-    var loader_buffer: [heap.pageSize()]u8 = undefined;
+    var loader_buffer: [256 * 1024]u8 = undefined;
     var loader: Loader = .init(cli, &loader_buffer);
     defer loader.deinit(io);
 

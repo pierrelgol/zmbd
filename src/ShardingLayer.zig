@@ -1,10 +1,11 @@
 const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
+
 pub const ShardingLayer = @This();
 
 file: Io.File,
-memory_map: Io.File.MemoryMap,
+size: usize,
 allocator: ?mem.Allocator = null,
 items: []Item = &.{},
 ready_queue_storage: []*Item = &.{},
@@ -26,10 +27,6 @@ pub const Range = struct {
 pub const Item = struct {
     index: usize,
     range: Range,
-
-    pub fn slice(self: Item, layer: *const ShardingLayer) []const u8 {
-        return layer.slice(self.range);
-    }
 };
 
 pub const ReadyQueue = Io.Queue(*Item);
@@ -39,44 +36,16 @@ pub fn open(io: Io, cwd: Io.Dir, sub_path: []const u8) !ShardingLayer {
     errdefer file.close(io);
 
     const stat = try file.stat(io);
-    const len = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
-    const memory_map = try file.createMemoryMap(io, .{
-        .len = len,
-        .protection = .{ .read = true, .write = false },
-        .populate = false,
-    });
-
     return .{
         .file = file,
-        .memory_map = memory_map,
+        .size = std.math.cast(usize, stat.size) orelse return error.FileTooBig,
     };
 }
 
 pub fn deinit(self: *ShardingLayer, io: Io) void {
     self.deinitQueue(io);
-    self.memory_map.destroy(io);
     self.file.close(io);
     self.* = undefined;
-}
-
-pub fn bytes(self: *const ShardingLayer) []const u8 {
-    return self.memory_map.memory;
-}
-
-pub fn slice(self: *const ShardingLayer, range: Range) []const u8 {
-    return self.bytes()[range.start..range.end];
-}
-
-pub fn rangeAt(self: *const ShardingLayer, index: usize, count: usize, delimiter: u8) Range {
-    return rangeAtBytes(self.bytes(), index, count, delimiter);
-}
-
-pub fn fillRanges(self: *const ShardingLayer, ranges: []Range, delimiter: u8) []Range {
-    const count = ranges.len;
-    for (ranges, 0..) |*range, index| {
-        range.* = rangeAtBytes(self.bytes(), index, count, delimiter);
-    }
-    return ranges;
 }
 
 pub fn initQueue(self: *ShardingLayer, allocator: mem.Allocator, io: Io, shard_count: usize, delimiter: u8) !void {
@@ -101,10 +70,11 @@ pub fn initQueue(self: *ShardingLayer, allocator: mem.Allocator, io: Io, shard_c
 
     self.ready_queue = .init(self.ready_queue_storage);
 
+    var scratch: [64 * 1024]u8 = undefined;
     for (self.items, 0..) |*item, index| {
         item.* = .{
             .index = index,
-            .range = self.rangeAt(index, shard_count, delimiter),
+            .range = try rangeAtFile(self.file, io, self.size, index, shard_count, delimiter, &scratch),
         };
         try self.ready_queue.?.putOneUncancelable(io, item);
     }
@@ -128,17 +98,30 @@ pub fn getReadyQueue(self: *ShardingLayer) *ReadyQueue {
     return &self.ready_queue.?;
 }
 
-fn rangeAtBytes(b: []const u8, index: usize, count: usize, delimiter: u8) Range {
+fn rangeAtFile(file: Io.File, io: Io, size: usize, index: usize, count: usize, delimiter: u8, scratch: []u8) !Range {
     std.debug.assert(count > 0);
     std.debug.assert(index < count);
 
-    const len = b.len;
-    if (len == 0) {
+    if (size == 0) {
         return .{ .start = 0, .end = 0 };
     }
 
-    const start = if (index == 0) 0 else boundaryAfter(b, proportionalOffset(len, index, count), delimiter);
-    const end = if (index + 1 == count) len else boundaryAfter(b, proportionalOffset(len, index + 1, count), delimiter);
+    const start = if (index == 0) 0 else try boundaryAfterFile(
+        file,
+        io,
+        size,
+        proportionalOffset(size, index, count),
+        delimiter,
+        scratch,
+    );
+    const end = if (index + 1 == count) size else try boundaryAfterFile(
+        file,
+        io,
+        size,
+        proportionalOffset(size, index + 1, count),
+        delimiter,
+        scratch,
+    );
 
     return .{
         .start = @min(start, end),
@@ -150,26 +133,34 @@ fn proportionalOffset(len: usize, index: usize, count: usize) usize {
     return (len * index) / count;
 }
 
-fn boundaryAfter(b: []const u8, start: usize, delimiter: u8) usize {
-    if (start >= b.len) {
-        return b.len;
+fn boundaryAfterFile(file: Io.File, io: Io, size: usize, start: usize, delimiter: u8, scratch: []u8) !usize {
+    if (start >= size) {
+        return size;
     }
 
-    var index = start;
-    while (index < b.len) : (index += 1) {
-        if (b[index] == delimiter) {
-            return index + 1;
+    var offset = start;
+    while (offset < size) {
+        const to_read = @min(scratch.len, size - offset);
+        const amt = try file.readPositionalAll(io, scratch[0..to_read], offset);
+        if (amt == 0) {
+            return size;
         }
+
+        if (mem.indexOfScalar(u8, scratch[0..amt], delimiter)) |pos| {
+            return offset + pos + 1;
+        }
+
+        offset += amt;
     }
 
-    return b.len;
+    return size;
 }
 
-test "rangeAtBytes aligns shard boundaries to delimiter" {
+test "rangeAtSlice aligns shard boundaries to delimiter" {
     const bytes_ = "aaa\nbbbb\ncc\n";
-    const a = rangeAtBytes(bytes_, 0, 3, '\n');
-    const b = rangeAtBytes(bytes_, 1, 3, '\n');
-    const c = rangeAtBytes(bytes_, 2, 3, '\n');
+    const a = rangeAtSlice(bytes_, 0, 3, '\n');
+    const b = rangeAtSlice(bytes_, 1, 3, '\n');
+    const c = rangeAtSlice(bytes_, 2, 3, '\n');
 
     try std.testing.expectEqual(@as(usize, 0), a.start);
     try std.testing.expectEqual(b.start, a.end);
@@ -181,10 +172,38 @@ test "rangeAtBytes aligns shard boundaries to delimiter" {
     try std.testing.expect(c.end == bytes_.len or bytes_[c.end - 1] == '\n');
 }
 
-test "rangeAtBytes returns empty trailing shards when shard count exceeds line count" {
+test "rangeAtSlice returns empty trailing shards when shard count exceeds line count" {
     const bytes_ = "abc\n";
 
-    try std.testing.expectEqualDeep(Range{ .start = 0, .end = 4 }, rangeAtBytes(bytes_, 0, 3, '\n'));
-    try std.testing.expectEqualDeep(Range{ .start = 4, .end = 4 }, rangeAtBytes(bytes_, 1, 3, '\n'));
-    try std.testing.expectEqualDeep(Range{ .start = 4, .end = 4 }, rangeAtBytes(bytes_, 2, 3, '\n'));
+    try std.testing.expectEqualDeep(Range{ .start = 0, .end = 4 }, rangeAtSlice(bytes_, 0, 3, '\n'));
+    try std.testing.expectEqualDeep(Range{ .start = 4, .end = 4 }, rangeAtSlice(bytes_, 1, 3, '\n'));
+    try std.testing.expectEqualDeep(Range{ .start = 4, .end = 4 }, rangeAtSlice(bytes_, 2, 3, '\n'));
+}
+
+fn rangeAtSlice(bytes_: []const u8, index: usize, count: usize, delimiter: u8) Range {
+    std.debug.assert(count > 0);
+    std.debug.assert(index < count);
+
+    if (bytes_.len == 0) {
+        return .{ .start = 0, .end = 0 };
+    }
+
+    const start = if (index == 0) 0 else boundaryAfterSlice(bytes_, proportionalOffset(bytes_.len, index, count), delimiter);
+    const end = if (index + 1 == count) bytes_.len else boundaryAfterSlice(bytes_, proportionalOffset(bytes_.len, index + 1, count), delimiter);
+    return .{ .start = @min(start, end), .end = end };
+}
+
+fn boundaryAfterSlice(bytes_: []const u8, start: usize, delimiter: u8) usize {
+    if (start >= bytes_.len) {
+        return bytes_.len;
+    }
+
+    var index = start;
+    while (index < bytes_.len) : (index += 1) {
+        if (bytes_[index] == delimiter) {
+            return index + 1;
+        }
+    }
+
+    return bytes_.len;
 }

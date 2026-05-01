@@ -42,8 +42,8 @@ pub fn sentenceFiller(self: *@This(), delimiter: u8) SentenceFiller {
     return .init(self.getReader(), delimiter);
 }
 
-pub fn mappedSentenceFiller(_: *@This(), bytes: []const u8, delimiter: u8) MappedSentenceFiller {
-    return .init(bytes, delimiter);
+pub fn rangeSentenceFiller(self: *@This(), file: Io.File, io: Io, range: ShardingLayer.Range, delimiter: u8) RangeSentenceFiller {
+    return .init(file, io, range, self.buffer, delimiter);
 }
 
 pub const Work = struct {
@@ -100,38 +100,89 @@ pub const SentenceFiller = struct {
     }
 };
 
-pub const MappedSentenceFiller = struct {
-    bytes: []const u8,
+pub const RangeSentenceFiller = struct {
+    file: Io.File,
+    io: Io,
+    range: ShardingLayer.Range,
+    buffer: []u8,
     delimiter: u8,
-    offset: usize = 0,
+    file_offset: usize,
+    buffer_start: usize = 0,
+    buffer_len: usize = 0,
 
-    pub fn init(bytes: []const u8, delimiter: u8) MappedSentenceFiller {
+    pub fn init(file: Io.File, io: Io, range: ShardingLayer.Range, buffer: []u8, delimiter: u8) RangeSentenceFiller {
         return .{
-            .bytes = bytes,
+            .file = file,
+            .io = io,
+            .range = range,
+            .buffer = buffer,
             .delimiter = delimiter,
+            .file_offset = range.start,
         };
     }
 
-    pub fn next(self: *MappedSentenceFiller, work_item: *Work) !void {
+    fn refill(self: *RangeSentenceFiller) !bool {
+        if (self.file_offset >= self.range.end) {
+            self.buffer_start = 0;
+            self.buffer_len = 0;
+            return false;
+        }
+
+        const to_read = @min(self.buffer.len, self.range.end - self.file_offset);
+        const amt = try self.file.readPositionalAll(self.io, self.buffer[0..to_read], self.file_offset);
+        self.file_offset += amt;
+        self.buffer_start = 0;
+        self.buffer_len = amt;
+        return amt != 0;
+    }
+
+    pub fn next(self: *RangeSentenceFiller, work_item: *Work) !void {
         work_item.reset();
 
-        while (self.offset < self.bytes.len and work_item.len < work_item.buffer.len) {
-            const byte = self.bytes[self.offset];
-            self.offset += 1;
+        while (true) {
+            if (self.buffer_start == self.buffer_len) {
+                const has_more = try self.refill();
+                if (!has_more) {
+                    if (work_item.len == 0) {
+                        return error.Canceled;
+                    }
+                    return;
+                }
+            }
 
-            if (byte == self.delimiter) {
+            const unread = self.buffer[self.buffer_start..self.buffer_len];
+            const remaining = work_item.buffer.len - work_item.len;
+
+            if (remaining == 0) {
+                return;
+            }
+
+            if (mem.indexOfScalar(u8, unread, self.delimiter)) |pos| {
+                const line = unread[0..pos];
+                const copy_len = @min(line.len, remaining);
+                mem.copyForwards(u8, work_item.buffer[work_item.len .. work_item.len + copy_len], line[0..copy_len]);
+                work_item.len += copy_len;
+                self.buffer_start += copy_len;
+
+                if (copy_len < line.len) {
+                    return;
+                }
+
+                self.buffer_start += 1;
                 if (work_item.len == 0) {
                     continue;
                 }
                 return;
             }
 
-            work_item.buffer[work_item.len] = byte;
-            work_item.len += 1;
-        }
+            const copy_len = @min(unread.len, remaining);
+            mem.copyForwards(u8, work_item.buffer[work_item.len .. work_item.len + copy_len], unread[0..copy_len]);
+            work_item.len += copy_len;
+            self.buffer_start += copy_len;
 
-        if (work_item.len == 0) {
-            return error.Canceled;
+            if (copy_len == remaining) {
+                return;
+            }
         }
     }
 };
