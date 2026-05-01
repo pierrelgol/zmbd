@@ -11,28 +11,12 @@ comptime {
     std.testing.refAllDecls(@This());
 }
 
-const AvailableQueue = Io.Queue(*Loader.Work);
+const FreeBlockQueue = Io.Queue(*Loader.Block);
+const ReadyBlockQueue = Io.Queue(*Loader.Block);
 const ShardQueue = ShardingLayer.ReadyQueue;
 const loader_buffer_size = 256 * 1024;
-const batch_size = 32;
+const block_sentence_capacity = 32;
 var global_metrics: Metrics = .{};
-
-const Batch = struct {
-    items: []*Loader.Work,
-    count: usize = 0,
-
-    fn init(items: []*Loader.Work) Batch {
-        std.debug.assert(items.len > 0);
-        return .{ .items = items };
-    }
-
-    fn reset(self: *Batch) void {
-        self.count = 0;
-    }
-};
-
-const FreeBatchQueue = Io.Queue(*Batch);
-const ReadyBatchQueue = Io.Queue(*Batch);
 
 const Metrics = struct {
     bytes_processed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -59,9 +43,8 @@ const Metrics = struct {
 const Context = struct {
     io: std.Io,
     policy: Tokenizer.Policy,
-    available_queue: *AvailableQueue,
-    free_batch_queue: *FreeBatchQueue,
-    ready_queue: *ReadyBatchQueue,
+    free_block_queue: *FreeBlockQueue,
+    ready_queue: *ReadyBlockQueue,
 };
 
 const LoaderContext = struct {
@@ -69,9 +52,9 @@ const LoaderContext = struct {
     cli: Cli,
     file: Io.File,
     shard_queue: *ShardQueue,
-    available_queue: *AvailableQueue,
-    free_batch_queue: *FreeBatchQueue,
-    ready_queues: []ReadyBatchQueue,
+    max_sentence_len: usize,
+    free_block_queue: *FreeBlockQueue,
+    ready_queues: []ReadyBlockQueue,
 };
 
 fn tokenizerWorker(context: Context) Io.Cancelable!void {
@@ -79,37 +62,33 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
     defer tokenizer.deinit();
 
     while (true) {
-        const work_item = context.ready_queue.getOne(context.io) catch |err| switch (err) {
+        const block = context.ready_queue.getOne(context.io) catch |err| switch (err) {
             error.Closed => return,
             error.Canceled => return error.Canceled,
         };
 
-        for (work_item.items[0..work_item.count]) |sentence_work| {
-            tokenizer.encode(sentence_work.slice());
-            context.available_queue.putOne(context.io, sentence_work) catch |err| switch (err) {
-                error.Closed => return,
-                error.Canceled => return error.Canceled,
-            };
+        for (block.spans[0..block.span_count]) |span| {
+            tokenizer.encode(block.slice(span));
         }
 
-        work_item.reset();
-        context.free_batch_queue.putOne(context.io, work_item) catch |err| switch (err) {
+        block.reset();
+        context.free_block_queue.putOne(context.io, block) catch |err| switch (err) {
             error.Closed => return,
             error.Canceled => return error.Canceled,
         };
     }
 }
 
-fn submitBatch(context: LoaderContext, batch: *Batch, target_queue: *ReadyBatchQueue) Io.Cancelable!void {
-    if (batch.count == 0) {
-        context.free_batch_queue.putOne(context.io, batch) catch |err| switch (err) {
+fn submitBlock(context: LoaderContext, block: *Loader.Block, target_queue: *ReadyBlockQueue) Io.Cancelable!void {
+    if (block.span_count == 0) {
+        context.free_block_queue.putOne(context.io, block) catch |err| switch (err) {
             error.Closed => return,
             error.Canceled => return error.Canceled,
         };
         return;
     }
 
-    target_queue.putOne(context.io, batch) catch |err| switch (err) {
+    target_queue.putOne(context.io, block) catch |err| switch (err) {
         error.Closed => return,
         error.Canceled => return error.Canceled,
     };
@@ -122,16 +101,16 @@ fn loaderWorker(context: LoaderContext) Io.Cancelable!void {
 
     var local_bytes_processed: usize = 0;
     var next_queue_index: usize = 0;
-    var batch = context.free_batch_queue.getOne(context.io) catch |err| switch (err) {
+    var block = context.free_block_queue.getOne(context.io) catch |err| switch (err) {
         error.Closed => return,
         error.Canceled => return error.Canceled,
     };
     defer global_metrics.addBytes(local_bytes_processed);
     defer {
-        if (batch.count != 0) {
-            submitBatch(context, batch, &context.ready_queues[next_queue_index]) catch {};
+        if (block.span_count != 0) {
+            submitBlock(context, block, &context.ready_queues[next_queue_index]) catch {};
         } else {
-            context.free_batch_queue.putOne(context.io, batch) catch {};
+            context.free_block_queue.putOne(context.io, block) catch {};
         }
     }
 
@@ -142,31 +121,19 @@ fn loaderWorker(context: LoaderContext) Io.Cancelable!void {
         };
 
         local_bytes_processed += shard_item.range.len();
-        var sentence_filler = loader.rangeSentenceFiller(context.file, context.io, shard_item.range, '\n');
+        var sentence_filler = loader.rangeBlockFiller(context.file, context.io, shard_item.range, '\n');
         while (true) {
-            const work_item = context.available_queue.getOne(context.io) catch |err| switch (err) {
-                error.Closed => return,
-                error.Canceled => return error.Canceled,
-            };
-
-            sentence_filler.next(work_item) catch |err| switch (err) {
+            sentence_filler.nextBlock(block, context.max_sentence_len) catch |err| switch (err) {
                 error.Canceled => {
-                    context.available_queue.putOne(context.io, work_item) catch |put_err| switch (put_err) {
-                        error.Closed => return,
-                        error.Canceled => return error.Canceled,
-                    };
                     break;
                 },
                 else => @panic(@errorName(err)),
             };
 
-            batch.items[batch.count] = work_item;
-            batch.count += 1;
-
-            if (batch.count == batch.items.len) {
-                try submitBatch(context, batch, &context.ready_queues[next_queue_index]);
+            if (block.span_count == block.spans.len or block.used == block.bytes.len) {
+                try submitBlock(context, block, &context.ready_queues[next_queue_index]);
                 next_queue_index = (next_queue_index + 1) % context.ready_queues.len;
-                batch = context.free_batch_queue.getOne(context.io) catch |err| switch (err) {
+                block = context.free_block_queue.getOne(context.io) catch |err| switch (err) {
                     error.Closed => return,
                     error.Canceled => return error.Canceled,
                 };
@@ -180,33 +147,23 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     const worker_count: usize = opt.worker_count;
     const loader_count: usize = opt.loader_count;
     const sequence_len = policy.effectiveMaxSequenceLength();
-    const effective_batch_size: usize = batch_size;
-    const batch_count = @max(loader_count * 2, worker_count);
-    // Keep enough sentence buffers to back every in-flight batch.
-    const work_item_count = @max(worker_count, batch_count * effective_batch_size);
+    const block_count = @max(loader_count * 2, worker_count);
+    const block_bytes_len = sequence_len * block_sentence_capacity;
 
-    const all_sequence_bytes = try gpa.alloc(u8, work_item_count * sequence_len);
-    defer gpa.free(all_sequence_bytes);
-
-    const work_items = try gpa.alloc(Loader.Work, work_item_count);
-    defer gpa.free(work_items);
-
-    const available_storage = try gpa.alloc(*Loader.Work, work_item_count);
-    defer gpa.free(available_storage);
-
-    const batches = try gpa.alloc(Batch, batch_count);
-    defer gpa.free(batches);
-    const batch_item_storage = try gpa.alloc(*Loader.Work, batch_count * effective_batch_size);
-    defer gpa.free(batch_item_storage);
-    const free_batch_storage = try gpa.alloc(*Batch, batch_count);
-    defer gpa.free(free_batch_storage);
-    const ready_queues = try gpa.alloc(ReadyBatchQueue, worker_count);
+    const all_block_bytes = try gpa.alloc(u8, block_count * block_bytes_len);
+    defer gpa.free(all_block_bytes);
+    const all_block_spans = try gpa.alloc(Loader.Span, block_count * block_sentence_capacity);
+    defer gpa.free(all_block_spans);
+    const blocks = try gpa.alloc(Loader.Block, block_count);
+    defer gpa.free(blocks);
+    const free_block_storage = try gpa.alloc(*Loader.Block, block_count);
+    defer gpa.free(free_block_storage);
+    const ready_queues = try gpa.alloc(ReadyBlockQueue, worker_count);
     defer gpa.free(ready_queues);
-    const ready_queue_storage = try gpa.alloc(*Batch, worker_count * loader_count);
+    const ready_queue_storage = try gpa.alloc(*Loader.Block, worker_count * block_count);
     defer gpa.free(ready_queue_storage);
 
-    var available_queue: AvailableQueue = .init(available_storage);
-    var free_batch_queue: FreeBatchQueue = .init(free_batch_storage);
+    var free_block_queue: FreeBlockQueue = .init(free_block_storage);
     var tokenizer_group: Io.Group = .init;
     var loader_group: Io.Group = .init;
 
@@ -214,31 +171,25 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
         for (ready_queues) |*queue| {
             queue.close(io);
         }
-        free_batch_queue.close(io);
-        available_queue.close(io);
+        free_block_queue.close(io);
         loader_group.cancel(io);
         tokenizer_group.cancel(io);
         loader_group.await(io) catch {};
         tokenizer_group.await(io) catch {};
     }
 
-    for (work_items, 0..) |*work_item, i| {
-        const start = i * sequence_len;
-        const end = start + sequence_len;
-        work_item.* = .init(all_sequence_bytes[start..end]);
-        try available_queue.putOneUncancelable(io, work_item);
-    }
-
-    for (batches, 0..) |*batch, i| {
-        const start = i * effective_batch_size;
-        const end = start + effective_batch_size;
-        batch.* = .init(batch_item_storage[start..end]);
-        try free_batch_queue.putOneUncancelable(io, batch);
+    for (blocks, 0..) |*block, i| {
+        const byte_start = i * block_bytes_len;
+        const byte_end = byte_start + block_bytes_len;
+        const span_start = i * block_sentence_capacity;
+        const span_end = span_start + block_sentence_capacity;
+        block.* = .init(all_block_bytes[byte_start..byte_end], all_block_spans[span_start..span_end]);
+        try free_block_queue.putOneUncancelable(io, block);
     }
 
     for (ready_queues, 0..) |*queue, i| {
-        const start = i * opt.loader_count;
-        const end = start + opt.loader_count;
+        const start = i * block_count;
+        const end = start + block_count;
         queue.* = .init(ready_queue_storage[start..end]);
     }
 
@@ -246,8 +197,7 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
         const worker_context = Context{
             .io = io,
             .policy = policy,
-            .available_queue = &available_queue,
-            .free_batch_queue = &free_batch_queue,
+            .free_block_queue = &free_block_queue,
             .ready_queue = ready_queue,
         };
         try tokenizer_group.concurrent(io, tokenizerWorker, .{worker_context});
@@ -266,8 +216,8 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
         .cli = opt,
         .file = sharding_layer.file,
         .shard_queue = sharding_layer.getReadyQueue(),
-        .available_queue = &available_queue,
-        .free_batch_queue = &free_batch_queue,
+        .max_sentence_len = sequence_len,
+        .free_block_queue = &free_block_queue,
         .ready_queues = ready_queues,
     };
 
