@@ -39,6 +39,16 @@ const Tokenizer = struct {
     ids: std.ArrayList(ByteEncoded.Id),
     masks: std.ArrayList(ByteEncoded.Mask),
 
+    pub const Policy = struct {
+        max_seq_len: u32 = 128,
+        add_bos: bool = true,
+        add_eos: bool = true,
+
+        pub fn overhead(policy: Policy) usize {
+            return if (policy.add_bos and policy.add_eos) 2 else if (policy.add_bos or policy.add_eos) 1 else 0;
+        }
+    };
+
     pub fn init(gpa: mem.Allocator) Tokenizer {
         return .{
             .arena = .init(gpa),
@@ -52,20 +62,35 @@ const Tokenizer = struct {
         defer self.arena.deinit();
     }
 
-    pub fn encode(self: *Tokenizer, sentence: []const u8) !void {
+    pub fn reset(self: *Tokenizer) void {
         _ = self.arena.reset(.retain_capacity);
         self.ids = .empty;
         self.masks = .empty;
-        const pow_of_2_padded_size = try std.math.ceilPowerOfTwo(usize, sentence.len + 2);
-        // std.debug.print("{d}\n", .{pow_of_2_padded_size});
+    }
 
-        try self.ids.ensureTotalCapacityPrecise(self.arena.allocator(), pow_of_2_padded_size);
-        try self.masks.ensureTotalCapacityPrecise(self.arena.allocator(), pow_of_2_padded_size);
+    fn nextPowerOf2(_: *const Tokenizer, len: usize) error{Overflow}!usize {
+        return try std.math.ceilPowerOfTwo(usize, len);
+    }
 
+    fn ensureTotalCapacityPrecise(self: *Tokenizer, allocator: mem.Allocator, new_capacity: usize) !void {
+        try self.ids.ensureTotalCapacityPrecise(allocator, new_capacity);
+        try self.masks.ensureTotalCapacityPrecise(allocator, new_capacity);
+    }
+
+    pub fn encode(self: *Tokenizer, sentence: []const u8, policy: Policy) !void {
+        const capacity = try self.nextPowerOf2(sentence.len + policy.overhead());
+        self.reset();
+        try self.ensureTotalCapacityPrecise(self.arena.allocator(), capacity);
         self.beginSentenceAssumeCapacity();
         self.encodeSentenceAssumeCapacity(sentence);
         self.endSentenceAssumeCapacity();
-        self.padSentenceAssumeCapacity(pow_of_2_padded_size - (sentence.len + 2));
+        self.padSentenceAssumeCapacity(capacity - policy.overhead());
+    }
+
+    fn encodeAssumePolicyCompliant(self: *Tokenizer, sentence: []const u8, policy: Policy) void {
+        _ = self;
+        _ = sentence;
+        _ = policy;
     }
 
     fn beginSentenceAssumeCapacity(self: *Tokenizer) void {
@@ -163,11 +188,7 @@ pub fn encodeStreaming(io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void
         reader.toss(1);
 
         bytes_written += sentence.len;
-        try tokenizer.encode(sentence);
-
-        // for (tokenizer.ids.items, tokenizer.masks.items) |id, m| {
-        //     std.debug.print("{d}:{d} ", .{ id, m });
-        // }
+        try tokenizer.encode(sentence, .{});
     }
 }
 
@@ -185,7 +206,7 @@ pub fn encodeAlloc(gpa: mem.Allocator, io: std.Io, loader: *Loader, tokenizer: *
     var it = mem.tokenizeScalar(u8, file_content, '\n');
     while (it.next()) |sentence| {
         bytes_written += sentence.len;
-        try tokenizer.encode(sentence);
+        try tokenizer.encode(sentence, .{});
     }
 }
 
