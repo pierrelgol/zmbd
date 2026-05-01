@@ -3,13 +3,13 @@ const ascii = std.ascii;
 const mem = std.mem;
 const process = std.process;
 
-filename: []const u8,
+filename: ?[]const u8,
 worker_count: u32,
 loader_count: u32,
 max_seq_length: u32,
 
 pub const empty: @This() = .{
-    .filename = undefined,
+    .filename = null,
     .worker_count = 8,
     .max_seq_length = 128,
     .loader_count = 4,

@@ -22,9 +22,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     run_cmd.step.dependOn(b.getInstallStep());
-
-    run_cmd.addArg("-p");
-    run_cmd.addFileArg(b.path("asset/big.txt"));
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
