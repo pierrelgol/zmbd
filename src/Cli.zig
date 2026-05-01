@@ -9,7 +9,7 @@ max_seq_length: u32,
 
 pub const empty: @This() = .{
     .filename = undefined,
-    .worker_count = 1,
+    .worker_count = 8,
     .max_seq_length = 128,
 };
 
