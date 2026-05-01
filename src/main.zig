@@ -38,6 +38,8 @@ const Tokenizer = struct {
     arena: heap.ArenaAllocator,
     ids: std.ArrayList(ByteEncoded.Id),
     masks: std.ArrayList(ByteEncoded.Mask),
+    const valid_mask: ByteEncoded.Mask = 1;
+    const pad_mask: ByteEncoded.Mask = 0;
 
     pub const Policy = struct {
         max_seq_len: u32 = 128,
@@ -45,7 +47,11 @@ const Tokenizer = struct {
         add_eos: bool = true,
 
         pub fn overhead(policy: Policy) usize {
-            return if (policy.add_bos and policy.add_eos) 2 else if (policy.add_bos or policy.add_eos) 1 else 0;
+            return @intFromBool(policy.add_bos) + @intFromBool(policy.add_eos);
+        }
+
+        pub fn effectiveMaxSequenceLength(policy: Policy) usize {
+            return policy.max_seq_len -| policy.overhead();
         }
     };
 
@@ -68,51 +74,50 @@ const Tokenizer = struct {
         self.masks = .empty;
     }
 
-    fn nextPowerOf2(_: *const Tokenizer, len: usize) error{Overflow}!usize {
+    fn paddedCapacity(len: usize) error{Overflow}!usize {
         return try std.math.ceilPowerOfTwo(usize, len);
     }
 
-    fn ensureTotalCapacityPrecise(self: *Tokenizer, allocator: mem.Allocator, new_capacity: usize) !void {
+    fn ensureTotalCapacityPrecise(self: *Tokenizer, new_capacity: usize) !void {
+        const allocator = self.arena.allocator();
         try self.ids.ensureTotalCapacityPrecise(allocator, new_capacity);
         try self.masks.ensureTotalCapacityPrecise(allocator, new_capacity);
     }
 
     pub fn encode(self: *Tokenizer, sentence: []const u8, policy: Policy) !void {
-        const capacity = try self.nextPowerOf2(sentence.len + policy.overhead());
+        const encoded_len = sentence.len + policy.overhead();
+        const capacity = try paddedCapacity(encoded_len);
+        const padding_len = capacity - encoded_len;
+
         self.reset();
-        try self.ensureTotalCapacityPrecise(self.arena.allocator(), capacity);
-        self.beginSentenceAssumeCapacity();
-        self.encodeSentenceAssumeCapacity(sentence);
-        self.endSentenceAssumeCapacity();
-        self.padSentenceAssumeCapacity(capacity - policy.overhead());
+        try self.ensureTotalCapacityPrecise(capacity);
+        self.encodeAssumeCapacity(sentence, policy, padding_len);
     }
 
-    fn encodeAssumePolicyCompliant(self: *Tokenizer, sentence: []const u8, policy: Policy) void {
-        _ = self;
-        _ = sentence;
-        _ = policy;
-    }
-
-    fn beginSentenceAssumeCapacity(self: *Tokenizer) void {
-        self.ids.appendAssumeCapacity(.bos);
-        self.masks.appendAssumeCapacity(1);
-    }
-
-    fn encodeSentenceAssumeCapacity(self: *Tokenizer, sentence: []const u8) void {
-        for (sentence) |byte| {
-            self.ids.appendAssumeCapacity(.from(byte));
-            self.masks.appendAssumeCapacity(@as(u1, 1));
+    fn encodeAssumeCapacity(self: *Tokenizer, sentence: []const u8, policy: Policy, padding_len: usize) void {
+        if (policy.add_bos) {
+            self.appendAssumeCapacity(.bos, valid_mask);
         }
+
+        for (sentence) |byte| {
+            self.appendAssumeCapacity(.from(byte), valid_mask);
+        }
+
+        if (policy.add_eos) {
+            self.appendAssumeCapacity(.eos, valid_mask);
+        }
+
+        self.padAssumeCapacity(padding_len);
     }
 
-    fn endSentenceAssumeCapacity(self: *Tokenizer) void {
-        self.ids.appendAssumeCapacity(.eos);
-        self.masks.appendAssumeCapacity(1);
+    fn appendAssumeCapacity(self: *Tokenizer, id: ByteEncoded.Id, mask: ByteEncoded.Mask) void {
+        self.ids.appendAssumeCapacity(id);
+        self.masks.appendAssumeCapacity(mask);
     }
 
-    fn padSentenceAssumeCapacity(self: *Tokenizer, n: usize) void {
+    fn padAssumeCapacity(self: *Tokenizer, n: usize) void {
         self.ids.appendNTimesAssumeCapacity(.pad, n);
-        self.masks.appendNTimesAssumeCapacity(@as(u1, 0), n);
+        self.masks.appendNTimesAssumeCapacity(pad_mask, n);
     }
 
     pub const ByteEncoded = struct {
@@ -130,7 +135,7 @@ const Tokenizer = struct {
                 return @as(u32, @intFromEnum(id));
             }
         };
-        // 0 is for padding, 1 is for attentions
+        // 0 marks padding, 1 marks tokens consumed by the model.
         pub const Mask = u1;
     };
 };
@@ -140,6 +145,57 @@ const Loader = struct {
     file: ?Io.File,
     buffer: []u8,
     reader: ?Io.File.Reader,
+
+    const SentenceIterator = struct {
+        reader: *Io.Reader,
+        max_sentence_len: usize,
+        delimiter: u8,
+        pending: ?[]const u8 = null,
+        offset: usize = 0,
+
+        pub fn init(reader: *Io.Reader, max_sentence_len: usize, delimiter: u8) SentenceIterator {
+            std.debug.assert(max_sentence_len > 0);
+
+            return .{
+                .reader = reader,
+                .max_sentence_len = max_sentence_len,
+                .delimiter = delimiter,
+            };
+        }
+
+        pub fn next(self: *SentenceIterator) !?[]const u8 {
+            if (self.pending) |sentence| {
+                return self.takeChunk(sentence);
+            }
+
+            const sentence = try self.nextSentence() orelse return null;
+            self.pending = sentence;
+            self.offset = 0;
+            return self.takeChunk(sentence);
+        }
+
+        fn nextSentence(self: *SentenceIterator) !?[]const u8 {
+            const sentence = self.reader.takeDelimiterExclusive(self.delimiter) catch |err| switch (err) {
+                error.EndOfStream => return null,
+                else => return err,
+            };
+            self.reader.toss(1);
+            return sentence;
+        }
+
+        fn takeChunk(self: *SentenceIterator, sentence: []const u8) []const u8 {
+            const end = @min(self.offset + self.max_sentence_len, sentence.len);
+            const chunk = sentence[self.offset..end];
+
+            self.offset = end;
+            if (self.offset == sentence.len) {
+                self.pending = null;
+                self.offset = 0;
+            }
+
+            return chunk;
+        }
+    };
 
     pub fn init(cli: Cli, buffer: []u8) Loader {
         return .{
@@ -168,14 +224,19 @@ const Loader = struct {
     pub fn getReader(self: *Loader) *Io.Reader {
         return &self.reader.?.interface;
     }
+
+    pub fn sentenceIterator(self: *Loader, policy: Tokenizer.Policy, delimiter: u8) SentenceIterator {
+        return .init(self.getReader(), policy.effectiveMaxSequenceLength(), delimiter);
+    }
 };
 
 pub fn encodeStreaming(io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void {
+    const policy: Tokenizer.Policy = .{};
     loader.loadStreaming(io, .cwd()) catch |err| {
         return log.err("{}", .{err});
     };
 
-    const reader = loader.getReader();
+    var sentence_it = loader.sentenceIterator(policy, '\n');
 
     const begin = Io.Timestamp.now(io, .awake);
     var bytes_written: usize = 0;
@@ -184,11 +245,9 @@ pub fn encodeStreaming(io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void
         const throughput = @as(f64, @floatFromInt(bytes_written)) / @as(f64, @floatFromInt(elapsed.nanoseconds)) * @as(f64, std.time.ns_per_s);
         log.info("time : {f} | throughput: {B}/s", .{ elapsed, @as(usize, @intFromFloat(throughput)) });
     }
-    while (reader.takeDelimiterExclusive('\n') catch null) |sentence| {
-        reader.toss(1);
-
+    while (try sentence_it.next()) |sentence| {
         bytes_written += sentence.len;
-        try tokenizer.encode(sentence, .{});
+        try tokenizer.encode(sentence, policy);
     }
 }
 
