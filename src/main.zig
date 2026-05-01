@@ -4,8 +4,12 @@ const heap = std.heap;
 const log = std.log;
 const Io = std.Io;
 const Cli = @import("Cli.zig");
+const ShardingLayer = @import("ShardingLayer.zig");
 const Loader = @import("Loader.zig");
 const Tokenizer = @import("Tokenizer.zig");
+comptime {
+    std.testing.refAllDecls(@This());
+}
 
 const AvailableQueue = Io.Queue(*Loader.Work);
 const ReadyQueue = Io.Queue(*Loader.Work);
