@@ -43,6 +43,8 @@ const Context = struct {
 fn tokenizerWorker(context: Context) Io.Cancelable!void {
     var tokenizer: Tokenizer = Tokenizer.initWithPolicy(std.heap.page_allocator, context.policy) catch |err| @panic(@errorName(err));
     defer tokenizer.deinit();
+    var bytes_processed: usize = 0;
+    defer global_metrics.addBytes(bytes_processed);
 
     while (true) {
         const work_item = context.ready_queue.getOne(context.io) catch |err| switch (err) {
@@ -52,7 +54,7 @@ fn tokenizerWorker(context: Context) Io.Cancelable!void {
 
         const sentence = work_item.slice();
         tokenizer.encode(sentence);
-        global_metrics.addBytes(sentence.len);
+        bytes_processed += sentence.len;
         context.available_queue.putOne(context.io, work_item) catch |err| switch (err) {
             error.Closed => return,
             error.Canceled => return error.Canceled,
