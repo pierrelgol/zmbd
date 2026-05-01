@@ -6,13 +6,44 @@ const log = std.log;
 const ascii = std.ascii;
 const Io = std.Io;
 
+const AvailableQueue = Io.Queue(*Loader.Work);
+const ReadyQueue = Io.Queue(*Loader.Work);
+var global_metrics: Metrics = .{};
+
+const Metrics = struct {
+    bytes_processed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn reset(self: *Metrics) void {
+        self.bytes_processed.store(0, .unordered);
+    }
+
+    fn addBytes(self: *Metrics, n: usize) void {
+        _ = self.bytes_processed.fetchAdd(n, .monotonic);
+    }
+
+    fn report(self: *const Metrics, elapsed_ns: u64) void {
+        const bytes_processed: f64 = @floatFromInt(self.bytes_processed.load(.monotonic));
+        const elapsed_ns_f64: f64 = @floatFromInt(elapsed_ns);
+        const throughput: f64 = if (elapsed_ns == 0) 0 else bytes_processed / elapsed_ns_f64 * std.time.ns_per_s;
+        log.info("time : {d:.3}ms | throughput: {B}/s", .{
+            elapsed_ns_f64 / std.time.ns_per_ms,
+            @as(u64, @intFromFloat(throughput)),
+        });
+    }
+};
+
+const Context = struct {
+    io: std.Io,
+    policy: Tokenizer.Policy,
+    available_queue: *AvailableQueue,
+    ready_queue: *ReadyQueue,
+};
+
 const Cli = struct {
     filename: []const u8,
-    bench_encode: bool = false,
 
     pub const empty: Cli = .{
         .filename = undefined,
-        .bench_encode = false,
     };
 
     pub fn parse(it: *process.Args.Iterator) !Cli {
@@ -23,10 +54,6 @@ const Cli = struct {
 
             if (mem.eql(u8, "-p", trimmed)) {
                 result.filename = it.next() orelse return error.MissingArgument;
-            }
-
-            if (mem.eql(u8, "-be", trimmed)) {
-                result.bench_encode = true;
             }
         }
 
@@ -42,12 +69,12 @@ const Tokenizer = struct {
     const pad_mask: ByteEncoded.Mask = 0;
 
     pub const Policy = struct {
-        max_seq_len: u32 = 128,
+        max_seq_len: u32 = 4096,
         add_bos: bool = true,
         add_eos: bool = true,
 
         pub fn overhead(policy: Policy) usize {
-            return @intFromBool(policy.add_bos) + @intFromBool(policy.add_eos);
+            return @as(usize, @intFromBool(policy.add_bos)) + @as(usize, @intFromBool(policy.add_eos));
         }
 
         pub fn effectiveMaxSequenceLength(policy: Policy) usize {
@@ -146,78 +173,6 @@ const Loader = struct {
     buffer: []u8,
     reader: ?Io.File.Reader,
 
-    pub const WorkItem = struct {
-        buffer: []u8,
-        len: usize = 0,
-
-        pub fn init(buffer: []u8) WorkItem {
-            std.debug.assert(buffer.len > 0);
-
-            return .{
-                .buffer = buffer,
-            };
-        }
-
-        pub fn slice(self: *const WorkItem) []const u8 {
-            return self.buffer[0..self.len];
-        }
-
-        fn reset(self: *WorkItem) void {
-            self.len = 0;
-        }
-    };
-
-    const SentenceFiller = struct {
-        reader: *Io.Reader,
-        delimiter: u8,
-        pending: ?[]const u8 = null,
-        offset: usize = 0,
-
-        pub fn init(reader: *Io.Reader, delimiter: u8) SentenceFiller {
-            return .{
-                .reader = reader,
-                .delimiter = delimiter,
-            };
-        }
-
-        pub fn fillNext(self: *SentenceFiller, work_item: *WorkItem) !void {
-            work_item.reset();
-
-            if (self.pending) |sentence| {
-                self.takeChunkInto(sentence, work_item);
-                return;
-            }
-
-            const sentence = try self.nextSentence() orelse return error.Canceled;
-            self.pending = sentence;
-            self.offset = 0;
-            self.takeChunkInto(sentence, work_item);
-        }
-
-        fn nextSentence(self: *SentenceFiller) !?[]const u8 {
-            const sentence = self.reader.takeDelimiterExclusive(self.delimiter) catch |err| switch (err) {
-                error.EndOfStream => return null,
-                else => return err,
-            };
-            self.reader.toss(1);
-            return sentence;
-        }
-
-        fn takeChunkInto(self: *SentenceFiller, sentence: []const u8, work_item: *WorkItem) void {
-            const end = @min(self.offset + work_item.buffer.len, sentence.len);
-            const chunk = sentence[self.offset..end];
-
-            @memcpy(work_item.buffer[0..chunk.len], chunk);
-            work_item.len = chunk.len;
-
-            self.offset = end;
-            if (self.offset == sentence.len) {
-                self.pending = null;
-                self.offset = 0;
-            }
-        }
-    };
-
     pub fn init(cli: Cli, buffer: []u8) Loader {
         return .{
             .cli = cli,
@@ -249,62 +204,157 @@ const Loader = struct {
     pub fn sentenceFiller(self: *Loader, delimiter: u8) SentenceFiller {
         return .init(self.getReader(), delimiter);
     }
+
+    pub const Work = struct {
+        buffer: []u8,
+        len: usize = 0,
+
+        pub fn init(buffer: []u8) Work {
+            std.debug.assert(buffer.len > 0);
+
+            return .{
+                .buffer = buffer,
+            };
+        }
+
+        pub fn slice(self: *const Work) []const u8 {
+            return self.buffer[0..self.len];
+        }
+
+        fn reset(self: *Work) void {
+            self.len = 0;
+        }
+    };
+
+    const SentenceFiller = struct {
+        reader: *Io.Reader,
+        delimiter: u8,
+
+        pub fn init(reader: *Io.Reader, delimiter: u8) SentenceFiller {
+            return .{
+                .reader = reader,
+                .delimiter = delimiter,
+            };
+        }
+
+        pub fn next(self: *SentenceFiller, work_item: *Work) !void {
+            work_item.reset();
+            while (work_item.len < work_item.buffer.len) : (work_item.len += 1) {
+                const byte = self.reader.takeByte() catch |err| switch (err) {
+                    error.EndOfStream => {
+                        if (work_item.len == 0) {
+                            return error.Canceled;
+                        }
+                        return;
+                    },
+                    else => return err,
+                };
+
+                if (byte == self.delimiter) {
+                    return;
+                }
+
+                work_item.buffer[work_item.len] = byte;
+            }
+        }
+    };
 };
 
-pub fn encodeStreaming(gpa: mem.Allocator, io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void {
+fn tokenizerWorker(context: Context) Io.Cancelable!void {
+    var tokenizer: Tokenizer = .init(std.heap.page_allocator);
+    defer tokenizer.deinit();
+
+    while (true) {
+        const work_item = context.ready_queue.getOne(context.io) catch |err| switch (err) {
+            error.Closed => return,
+            error.Canceled => return error.Canceled,
+        };
+
+        const sentence = work_item.slice();
+        tokenizer.encode(sentence, context.policy) catch |err| @panic(@errorName(err));
+        global_metrics.addBytes(sentence.len);
+        context.available_queue.putOne(context.io, work_item) catch |err| switch (err) {
+            error.Closed => return,
+            error.Canceled => return error.Canceled,
+        };
+    }
+}
+
+fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, loader: *Loader) !void {
     const policy: Tokenizer.Policy = .{};
-    const sequence_buffer = try gpa.alloc(u8, policy.effectiveMaxSequenceLength());
-    defer gpa.free(sequence_buffer);
+    const worker_count = 128;
+    const sequence_len = policy.effectiveMaxSequenceLength();
+
+    const all_sequence_bytes = try gpa.alloc(u8, worker_count * sequence_len);
+    defer gpa.free(all_sequence_bytes);
+
+    const work_items = try gpa.alloc(Loader.Work, worker_count);
+    defer gpa.free(work_items);
+
+    const available_storage = try gpa.alloc(*Loader.Work, worker_count);
+    defer gpa.free(available_storage);
+
+    const ready_storage = try gpa.alloc(*Loader.Work, worker_count);
+    defer gpa.free(ready_storage);
+
+    var available_queue: AvailableQueue = .init(available_storage);
+    var ready_queue: ReadyQueue = .init(ready_storage);
+    var group: Io.Group = .init;
+
+    errdefer {
+        ready_queue.close(io);
+        available_queue.close(io);
+        group.cancel(io);
+        group.await(io) catch {};
+    }
+
+    for (work_items, 0..) |*work_item, i| {
+        const start = i * sequence_len;
+        const end = start + sequence_len;
+        work_item.* = .init(all_sequence_bytes[start..end]);
+        try available_queue.putOneUncancelable(io, work_item);
+    }
+
+    const worker_context = Context{
+        .io = io,
+        .policy = policy,
+        .available_queue = &available_queue,
+        .ready_queue = &ready_queue,
+    };
+
+    for (0..worker_count) |_| {
+        try group.concurrent(io, tokenizerWorker, .{worker_context});
+    }
 
     loader.loadStreaming(io, .cwd()) catch |err| {
         return log.err("{}", .{err});
     };
 
-    var work_item: Loader.WorkItem = .init(sequence_buffer);
     var sentence_filler = loader.sentenceFiller('\n');
-
-    const begin = Io.Timestamp.now(io, .awake);
-    var bytes_written: usize = 0;
-    defer {
-        const elapsed = begin.untilNow(io, .awake);
-        const throughput = @as(f64, @floatFromInt(bytes_written)) / @as(f64, @floatFromInt(elapsed.nanoseconds)) * @as(f64, std.time.ns_per_s);
-        log.info("time : {f} | throughput: {B}/s", .{ elapsed, @as(usize, @intFromFloat(throughput)) });
-    }
     while (true) {
-        sentence_filler.fillNext(&work_item) catch |err| switch (err) {
-            error.Canceled => break,
+        const work_item = try available_queue.getOneUncancelable(io);
+        sentence_filler.next(work_item) catch |err| switch (err) {
+            error.Canceled => {
+                try available_queue.putOneUncancelable(io, work_item);
+                ready_queue.close(io);
+                return try group.await(io);
+            },
             else => return err,
         };
-
-        const sentence = work_item.slice();
-        bytes_written += sentence.len;
-        try tokenizer.encode(sentence, policy);
+        try ready_queue.putOneUncancelable(io, work_item);
     }
 }
 
-pub fn encodeAlloc(gpa: mem.Allocator, io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void {
-    const file_content = try loader.loadAllocOwned(gpa, io, .cwd());
-    defer gpa.free(file_content);
+pub fn main(init: std.process.Init.Minimal) !void {
+    const gpa = heap.smp_allocator;
+    var threaded = Io.Threaded.init(gpa, .{
+        .argv0 = .init(init.args),
+        .environ = init.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    const begin = Io.Timestamp.now(io, .awake);
-    var bytes_written: usize = 0;
-    defer {
-        const elapsed = begin.untilNow(io, .awake);
-        const throughput = @as(f64, @floatFromInt(bytes_written)) / @as(f64, @floatFromInt(elapsed.nanoseconds)) * @as(f64, std.time.ns_per_s);
-        log.info("time : {f} | throughput: {B}/s", .{ elapsed, @as(usize, @intFromFloat(throughput)) });
-    }
-    var it = mem.tokenizeScalar(u8, file_content, '\n');
-    while (it.next()) |sentence| {
-        bytes_written += sentence.len;
-        try tokenizer.encode(sentence, .{});
-    }
-}
-
-pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-
-    var args = init.minimal.args.iterateAllocator(gpa) catch |err| {
+    var args = init.args.iterateAllocator(gpa) catch |err| {
         return log.err("{}", .{err});
     };
     defer args.deinit();
@@ -321,10 +371,13 @@ pub fn main(init: std.process.Init) !void {
     var tokenizer: Tokenizer = .init(gpa);
     defer tokenizer.deinit();
 
-    if (cli.bench_encode) {
-        try encodeAlloc(gpa, io, &loader, &tokenizer);
-    } else {
-        try encodeStreaming(gpa, io, &loader, &tokenizer);
+    global_metrics.reset();
+    const begin = Io.Timestamp.now(io, .awake);
+    defer {
+        const elapsed = begin.untilNow(io, .awake);
+        global_metrics.report(@intCast(elapsed.nanoseconds));
     }
+
+    try runQueuePipeline(gpa, io, &loader);
     std.debug.print("\n", .{});
 }
