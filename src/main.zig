@@ -14,10 +14,15 @@ comptime {
 const FreeBlockQueue = Io.Queue(*Loader.Block);
 const ReadyBlockQueue = Io.Queue(*Loader.Block);
 const ShardQueue = ShardingLayer.ReadyQueue;
-const loader_buffer_size = 256 * 1024;
-const block_sentence_capacity = 32;
+const loader_buffer_size = 1024 * 1024;
+const block_sentence_capacity = 1024;
 const asset_dir_name = "asset";
 var global_metrics: Metrics = .{};
+
+const AssetEntry = struct {
+    path: []u8,
+    size: u64,
+};
 
 const Metrics = struct {
     bytes_processed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -30,17 +35,17 @@ const Metrics = struct {
         _ = self.bytes_processed.fetchAdd(n, .monotonic);
     }
 
-    fn throughput(self: *const Metrics, elapsed_ns: u64) u64 {
+    fn throughput(self: *const Metrics, elapsed: Io.Duration) u64 {
         const bytes_processed: f64 = @floatFromInt(self.bytes_processed.load(.monotonic));
-        const elapsed_ns_f64: f64 = @floatFromInt(elapsed_ns);
-        const bytes_per_second: f64 = if (elapsed_ns == 0) 0 else bytes_processed / elapsed_ns_f64 * std.time.ns_per_s;
+        const elapsed_ns_f64: f64 = @floatFromInt(elapsed.nanoseconds);
+        const bytes_per_second: f64 = if (elapsed.nanoseconds == 0) 0 else bytes_processed / elapsed_ns_f64 * std.time.ns_per_s;
         return @intFromFloat(bytes_per_second);
     }
 
-    fn report(self: *const Metrics, elapsed_ns: u64) void {
-        log.info("time : {d:.3}ms | throughput: {B}/s", .{
-            @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms,
-            self.throughput(elapsed_ns),
+    fn report(self: *const Metrics, elapsed: Io.Duration) void {
+        log.info("time : {f} | throughput: {Bi}/s", .{
+            elapsed,
+            self.throughput(elapsed),
         });
     }
 };
@@ -237,22 +242,22 @@ fn runQueuePipeline(gpa: mem.Allocator, io: std.Io, opt: Cli) !void {
     return try tokenizer_group.await(io);
 }
 
-fn runOne(gpa: mem.Allocator, io: Io, cli: Cli, pretty: bool) !void {
+fn runOne(gpa: mem.Allocator, io: Io, cli: Cli, pretty: bool, size: u64) !void {
     global_metrics.reset();
     const begin = Io.Timestamp.now(io, .awake);
     try runQueuePipeline(gpa, io, cli);
     const elapsed = begin.untilNow(io, .awake);
-    const elapsed_ns: u64 = @intCast(elapsed.nanoseconds);
 
     if (pretty) {
-        std.debug.print("{s: <24}  {d: >9.3} ms  {B: >12}/s\n", .{
+        std.debug.print("{s: <24}  {Bi: >12}  {f: >10}  {Bi: >24}/s\n", .{
             cli.filename.?,
-            @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms,
-            global_metrics.throughput(elapsed_ns),
+            size,
+            elapsed,
+            global_metrics.throughput(elapsed),
         });
     } else {
         std.debug.print("{s}\n", .{cli.filename.?});
-        global_metrics.report(elapsed_ns);
+        global_metrics.report(elapsed);
         std.debug.print("\n", .{});
     }
 }
@@ -262,17 +267,37 @@ fn runAssetSuite(gpa: mem.Allocator, io: Io, cli: Cli) !void {
     defer dir.close(io);
 
     var it = dir.iterate();
-    std.debug.print("{s: <24}  {s: >9}  {s: >12}\n", .{ "file", "time", "throughput" });
+    var assets = try std.ArrayList(AssetEntry).initCapacity(gpa, 16);
+    defer {
+        for (assets.items) |entry| gpa.free(entry.path);
+        assets.deinit(gpa);
+    }
 
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
 
-        const filename = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ asset_dir_name, entry.name });
-        defer gpa.free(filename);
+        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ asset_dir_name, entry.name });
+        errdefer gpa.free(path);
+        const stat = try dir.statFile(io, entry.name, .{});
+        try assets.append(gpa, .{
+            .path = path,
+            .size = stat.size,
+        });
+    }
 
+    const lessThan = struct {
+        fn lessThan(_: void, lhs: AssetEntry, rhs: AssetEntry) bool {
+            return lhs.size < rhs.size;
+        }
+    }.lessThan;
+
+    std.mem.sort(AssetEntry, assets.items, {}, lessThan);
+    std.debug.print("{s: <24}  {s: >12}  {s: >10}  {s: >24}\n", .{ "file", "size", "time", "throughput" });
+
+    for (assets.items) |entry| {
         var file_cli = cli;
-        file_cli.filename = filename;
-        try runOne(gpa, io, file_cli, true);
+        file_cli.filename = entry.path;
+        try runOne(gpa, io, file_cli, true, entry.size);
     }
 }
 
@@ -295,7 +320,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
 
     if (cli.filename) |_| {
-        try runOne(gpa, io, cli, false);
+        try runOne(gpa, io, cli, false, 0);
     } else {
         try runAssetSuite(gpa, io, cli);
     }

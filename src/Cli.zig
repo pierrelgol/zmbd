@@ -12,7 +12,7 @@ pub const empty: @This() = .{
     .filename = null,
     .worker_count = 8,
     .max_seq_length = 128,
-    .loader_count = 4,
+    .loader_count = 8,
 };
 
 pub fn parse(it: *process.Args.Iterator) !@This() {
