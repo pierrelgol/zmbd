@@ -5,6 +5,10 @@ pub const ShardingLayer = @This();
 
 file: Io.File,
 memory_map: Io.File.MemoryMap,
+allocator: ?mem.Allocator = null,
+items: []Item = &.{},
+ready_queue_storage: []*Item = &.{},
+ready_queue: ?ReadyQueue = null,
 
 pub const Range = struct {
     start: usize,
@@ -18,6 +22,17 @@ pub const Range = struct {
         return self.start == self.end;
     }
 };
+
+pub const Item = struct {
+    index: usize,
+    range: Range,
+
+    pub fn slice(self: Item, layer: *const ShardingLayer) []const u8 {
+        return layer.slice(self.range);
+    }
+};
+
+pub const ReadyQueue = Io.Queue(*Item);
 
 pub fn open(io: Io, cwd: Io.Dir, sub_path: []const u8) !ShardingLayer {
     const file = try cwd.openFile(io, sub_path, .{ .mode = .read_only });
@@ -38,6 +53,7 @@ pub fn open(io: Io, cwd: Io.Dir, sub_path: []const u8) !ShardingLayer {
 }
 
 pub fn deinit(self: *ShardingLayer, io: Io) void {
+    self.deinitQueue(io);
     self.memory_map.destroy(io);
     self.file.close(io);
     self.* = undefined;
@@ -63,17 +79,66 @@ pub fn fillRanges(self: *const ShardingLayer, ranges: []Range, delimiter: u8) []
     return ranges;
 }
 
-fn rangeAtBytes(bytes_: []const u8, index: usize, count: usize, delimiter: u8) Range {
+pub fn initQueue(self: *ShardingLayer, allocator: mem.Allocator, io: Io, shard_count: usize, delimiter: u8) !void {
+    std.debug.assert(self.ready_queue == null);
+
+    self.allocator = allocator;
+    self.items = try allocator.alloc(Item, shard_count);
+    errdefer {
+        allocator.free(self.items);
+        self.items = &.{};
+        self.allocator = null;
+    }
+
+    self.ready_queue_storage = try allocator.alloc(*Item, shard_count);
+    errdefer {
+        allocator.free(self.ready_queue_storage);
+        self.ready_queue_storage = &.{};
+        allocator.free(self.items);
+        self.items = &.{};
+        self.allocator = null;
+    }
+
+    self.ready_queue = .init(self.ready_queue_storage);
+
+    for (self.items, 0..) |*item, index| {
+        item.* = .{
+            .index = index,
+            .range = self.rangeAt(index, shard_count, delimiter),
+        };
+        try self.ready_queue.?.putOneUncancelable(io, item);
+    }
+}
+
+pub fn deinitQueue(self: *ShardingLayer, io: Io) void {
+    if (self.ready_queue) |*queue| {
+        queue.close(io);
+        self.ready_queue = null;
+    }
+
+    const allocator = self.allocator orelse return;
+    allocator.free(self.ready_queue_storage);
+    allocator.free(self.items);
+    self.ready_queue_storage = &.{};
+    self.items = &.{};
+    self.allocator = null;
+}
+
+pub fn getReadyQueue(self: *ShardingLayer) *ReadyQueue {
+    return &self.ready_queue.?;
+}
+
+fn rangeAtBytes(b: []const u8, index: usize, count: usize, delimiter: u8) Range {
     std.debug.assert(count > 0);
     std.debug.assert(index < count);
 
-    const len = bytes_.len;
+    const len = b.len;
     if (len == 0) {
         return .{ .start = 0, .end = 0 };
     }
 
-    const start = if (index == 0) 0 else boundaryAfter(bytes_, proportionalOffset(len, index, count), delimiter);
-    const end = if (index + 1 == count) len else boundaryAfter(bytes_, proportionalOffset(len, index + 1, count), delimiter);
+    const start = if (index == 0) 0 else boundaryAfter(b, proportionalOffset(len, index, count), delimiter);
+    const end = if (index + 1 == count) len else boundaryAfter(b, proportionalOffset(len, index + 1, count), delimiter);
 
     return .{
         .start = @min(start, end),
@@ -85,19 +150,19 @@ fn proportionalOffset(len: usize, index: usize, count: usize) usize {
     return (len * index) / count;
 }
 
-fn boundaryAfter(bytes_: []const u8, start: usize, delimiter: u8) usize {
-    if (start >= bytes_.len) {
-        return bytes_.len;
+fn boundaryAfter(b: []const u8, start: usize, delimiter: u8) usize {
+    if (start >= b.len) {
+        return b.len;
     }
 
     var index = start;
-    while (index < bytes_.len) : (index += 1) {
-        if (bytes_[index] == delimiter) {
+    while (index < b.len) : (index += 1) {
+        if (b[index] == delimiter) {
             return index + 1;
         }
     }
 
-    return bytes_.len;
+    return b.len;
 }
 
 test "rangeAtBytes aligns shard boundaries to delimiter" {
