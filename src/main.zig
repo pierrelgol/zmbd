@@ -146,35 +146,55 @@ const Loader = struct {
     buffer: []u8,
     reader: ?Io.File.Reader,
 
-    const SentenceIterator = struct {
+    pub const WorkItem = struct {
+        buffer: []u8,
+        len: usize = 0,
+
+        pub fn init(buffer: []u8) WorkItem {
+            std.debug.assert(buffer.len > 0);
+
+            return .{
+                .buffer = buffer,
+            };
+        }
+
+        pub fn slice(self: *const WorkItem) []const u8 {
+            return self.buffer[0..self.len];
+        }
+
+        fn reset(self: *WorkItem) void {
+            self.len = 0;
+        }
+    };
+
+    const SentenceFiller = struct {
         reader: *Io.Reader,
-        max_sentence_len: usize,
         delimiter: u8,
         pending: ?[]const u8 = null,
         offset: usize = 0,
 
-        pub fn init(reader: *Io.Reader, max_sentence_len: usize, delimiter: u8) SentenceIterator {
-            std.debug.assert(max_sentence_len > 0);
-
+        pub fn init(reader: *Io.Reader, delimiter: u8) SentenceFiller {
             return .{
                 .reader = reader,
-                .max_sentence_len = max_sentence_len,
                 .delimiter = delimiter,
             };
         }
 
-        pub fn next(self: *SentenceIterator) !?[]const u8 {
+        pub fn fillNext(self: *SentenceFiller, work_item: *WorkItem) !void {
+            work_item.reset();
+
             if (self.pending) |sentence| {
-                return self.takeChunk(sentence);
+                self.takeChunkInto(sentence, work_item);
+                return;
             }
 
-            const sentence = try self.nextSentence() orelse return null;
+            const sentence = try self.nextSentence() orelse return error.Canceled;
             self.pending = sentence;
             self.offset = 0;
-            return self.takeChunk(sentence);
+            self.takeChunkInto(sentence, work_item);
         }
 
-        fn nextSentence(self: *SentenceIterator) !?[]const u8 {
+        fn nextSentence(self: *SentenceFiller) !?[]const u8 {
             const sentence = self.reader.takeDelimiterExclusive(self.delimiter) catch |err| switch (err) {
                 error.EndOfStream => return null,
                 else => return err,
@@ -183,17 +203,18 @@ const Loader = struct {
             return sentence;
         }
 
-        fn takeChunk(self: *SentenceIterator, sentence: []const u8) []const u8 {
-            const end = @min(self.offset + self.max_sentence_len, sentence.len);
+        fn takeChunkInto(self: *SentenceFiller, sentence: []const u8, work_item: *WorkItem) void {
+            const end = @min(self.offset + work_item.buffer.len, sentence.len);
             const chunk = sentence[self.offset..end];
+
+            @memcpy(work_item.buffer[0..chunk.len], chunk);
+            work_item.len = chunk.len;
 
             self.offset = end;
             if (self.offset == sentence.len) {
                 self.pending = null;
                 self.offset = 0;
             }
-
-            return chunk;
         }
     };
 
@@ -225,18 +246,22 @@ const Loader = struct {
         return &self.reader.?.interface;
     }
 
-    pub fn sentenceIterator(self: *Loader, policy: Tokenizer.Policy, delimiter: u8) SentenceIterator {
-        return .init(self.getReader(), policy.effectiveMaxSequenceLength(), delimiter);
+    pub fn sentenceFiller(self: *Loader, delimiter: u8) SentenceFiller {
+        return .init(self.getReader(), delimiter);
     }
 };
 
-pub fn encodeStreaming(io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void {
+pub fn encodeStreaming(gpa: mem.Allocator, io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void {
     const policy: Tokenizer.Policy = .{};
+    const sequence_buffer = try gpa.alloc(u8, policy.effectiveMaxSequenceLength());
+    defer gpa.free(sequence_buffer);
+
     loader.loadStreaming(io, .cwd()) catch |err| {
         return log.err("{}", .{err});
     };
 
-    var sentence_it = loader.sentenceIterator(policy, '\n');
+    var work_item: Loader.WorkItem = .init(sequence_buffer);
+    var sentence_filler = loader.sentenceFiller('\n');
 
     const begin = Io.Timestamp.now(io, .awake);
     var bytes_written: usize = 0;
@@ -245,7 +270,13 @@ pub fn encodeStreaming(io: std.Io, loader: *Loader, tokenizer: *Tokenizer) !void
         const throughput = @as(f64, @floatFromInt(bytes_written)) / @as(f64, @floatFromInt(elapsed.nanoseconds)) * @as(f64, std.time.ns_per_s);
         log.info("time : {f} | throughput: {B}/s", .{ elapsed, @as(usize, @intFromFloat(throughput)) });
     }
-    while (try sentence_it.next()) |sentence| {
+    while (true) {
+        sentence_filler.fillNext(&work_item) catch |err| switch (err) {
+            error.Canceled => break,
+            else => return err,
+        };
+
+        const sentence = work_item.slice();
         bytes_written += sentence.len;
         try tokenizer.encode(sentence, policy);
     }
@@ -293,7 +324,7 @@ pub fn main(init: std.process.Init) !void {
     if (cli.bench_encode) {
         try encodeAlloc(gpa, io, &loader, &tokenizer);
     } else {
-        try encodeStreaming(io, &loader, &tokenizer);
+        try encodeStreaming(gpa, io, &loader, &tokenizer);
     }
     std.debug.print("\n", .{});
 }
